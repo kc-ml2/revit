@@ -113,3 +113,5 @@ Desktop.ini
 *.bak
 *.swp
 
+=*
+imagenet_es_v2_outputs/
