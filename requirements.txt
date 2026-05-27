@@ -1,0 +1,17 @@
+# Core PyTorch (for CUDA-specific wheels, use https://pytorch.org/get-started/locally/)
+torch>=2.6.0
+torchvision>=0.21.0
+numpy>=1.26.0,<3
+
+# ESCNN stack (equivariant CNNs; Cython needed for lie_learn / extensions)
+Cython>=3.0.0
+git+https://github.com/AMLab-Amsterdam/lie_learn.git
+escnn>=1.0.11
+
+# Utilities
+tqdm>=4.66.0
+tensorboard>=2.14.0
+Pillow>=10.0.0
+matplotlib>=3.8.0
+
+# Standard library only (no install): argparse, copy, datetime, itertools, os, pathlib, random, typing
