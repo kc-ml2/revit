@@ -1,6 +1,6 @@
-# ReViT — Rotation-Equivariant Vision Transformer
+# REViT — Roto-reflection Equivariant convolutional Vision Transformer
 
-ReViT is a Vision Transformer whose self-attention and feed-forward layers are built entirely from **equivariant convolutions** via [ESCNN](https://github.com/QUVA-Lab/escnn). Every feature map is a `GeometricTensor` that transforms consistently under the chosen discrete rotation (or roto-reflection) group, so the model's predictions are invariant to those symmetries by construction.
+ReViT is a Vision Transformer whose self-attention and feed-forward layers are built entirely from **equivariant convolutions**. Every feature map is a `GeometricTensor` that transforms consistently under the chosen discrete rotation (or roto-reflection) group, so the model's predictions are invariant to those symmetries by construction.
 
 ## How it works
 
