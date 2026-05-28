@@ -40,16 +40,6 @@ Pass `--group-str` with one of:
 | `D12` | Dihedral-12 | 30° rotations + reflections |
 | `D16` | Dihedral-16 | 22.5° rotations + reflections |
 
-## Model sizes
-
-| Name | Stage dims | Stage depths | Heads |
-|---|---|---|---|
-| `tiny` | 24-48-96-192 | 1-1-3-1 | 1-2-4-8 |
-| `small-D4` | 24-48-96-192 | 1-2-4-1 | 1-2-4-8 |
-| `small` | 32-64-128-256 | 1-2-4-1 | 1-2-4-8 |
-| `base` | 64-128-256-512 | 2-2-6-2 | 2-4-8-16 |
-
-Dims, depths, and heads can also be overridden individually with `--dims`, `--depths`, and `--heads`.
 
 ## Installation
 
