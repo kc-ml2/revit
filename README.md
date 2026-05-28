@@ -5,7 +5,6 @@ REViT is a research codebase for rotation/roto-reflection equivariant vision tra
 - an equivariant transformer baseline (`Rot2DTransformer`) for small image datasets,
 - a windowed hierarchical equivariant transformer (`Rot2DTransformerV2`) for ImageNet-scale training,
 
-
 ## Repository layout
 
 ### Core models
@@ -176,7 +175,7 @@ tensorboard --logdir imagenet_vit_small_outputs/runs
 @inproceedings{
 zaheer2026revit,
 title={{REV}iT: Roto-reflection Equivariant Convolutional Vision Transformer},
-author={Anonymous},
+author={Zaheer, Sheir A. and Holston, Alexander C. and Park, Chan Y.},
 booktitle={Forty-third International Conference on Machine Learning},
 year={2026},
 url={https://openreview.net/forum?id=n2RIMdIbv6}
