@@ -3,6 +3,7 @@ import copy
 import os
 import random
 from datetime import datetime
+
 import numpy as np
 import torch
 import torch.distributed as dist
@@ -13,10 +14,16 @@ from torch.utils.data import DataLoader
 from torch.utils.data.distributed import DistributedSampler
 from torch.utils.tensorboard import SummaryWriter
 from torchvision import datasets, transforms
+from torchvision.models.vision_transformer import VisionTransformer
 from tqdm import tqdm
-from group_space import get_gspace
 
-from revit_windowed_gcsa import Rot2DTransformerV2, count_parameters
+
+def count_parameters(model: nn.Module):
+    total_params = sum(p.numel() for p in model.parameters())
+    trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    print(f"Total Parameters: {total_params}")
+    print(f"Trainable Parameters: {trainable_params}")
+    return total_params, trainable_params
 
 
 def seed_everything(seed: int = 42):
@@ -46,23 +53,6 @@ def is_main_process(rank):
     return rank is None or rank == 0
 
 
-def _strip_module_prefix(state_dict):
-    if not state_dict:
-        return state_dict
-    k0 = next(iter(state_dict.keys()))
-    if k0.startswith("module."):
-        return {key[len("module.") :]: value for key, value in state_dict.items()}
-    return state_dict
-
-
-def load_pretrained_weights(model: nn.Module, path: str, device: torch.device) -> dict:
-    ckpt = torch.load(path, map_location=device, weights_only=False)
-    if "model_state_dict" not in ckpt:
-        raise KeyError(f"Checkpoint at {path} has no 'model_state_dict' key")
-    model.load_state_dict(_strip_module_prefix(ckpt["model_state_dict"]))
-    return ckpt
-
-
 def get_imagenet_loaders(data_root, batch_size=256, num_workers=8, use_ddp=False):
     train_dir = os.path.join(data_root, "train")
     val_dir = os.path.join(data_root, "val")
@@ -71,7 +61,8 @@ def get_imagenet_loaders(data_root, batch_size=256, num_workers=8, use_ddp=False
     train_tfms = transforms.Compose(
         [
             transforms.RandomResizedCrop(224, scale=(0.08, 1.0)),
-            # transforms.RandomHorizontalFlip(),
+            transforms.RandomHorizontalFlip(),
+            transforms.RandomRotation(degrees=90),
             transforms.ColorJitter(0.4, 0.4, 0.4, 0.1),
             transforms.ToTensor(),
             normalize,
@@ -125,7 +116,11 @@ def train_one_epoch(model, loader, optimizer, scaler, device, epoch, rank, grad_
         y = y.to(device, non_blocking=True)
 
         optimizer.zero_grad(set_to_none=True)
-        with torch.autocast(device_type="cuda" if device.type == "cuda" else "cpu", dtype=torch.float16, enabled=device.type == "cuda"):
+        with torch.autocast(
+            device_type="cuda" if device.type == "cuda" else "cpu",
+            dtype=torch.float16,
+            enabled=device.type == "cuda",
+        ):
             out = model(x)
             loss = criterion(out, y)
 
@@ -161,7 +156,11 @@ def evaluate(model, loader, device, rank):
         x = x.to(device, non_blocking=True)
         y = y.to(device, non_blocking=True)
 
-        with torch.autocast(device_type="cuda" if device.type == "cuda" else "cpu", dtype=torch.float16, enabled=device.type == "cuda"):
+        with torch.autocast(
+            device_type="cuda" if device.type == "cuda" else "cpu",
+            dtype=torch.float16,
+            enabled=device.type == "cuda",
+        ):
             out = model(x)
             loss = criterion(out, y)
 
@@ -182,79 +181,46 @@ def evaluate(model, loader, device, rank):
     return total_loss / total, top1 / total, top5 / total
 
 
+def build_vit_small(num_classes=1000, image_size=224, patch_size=16, dropout=0.0, attention_dropout=0.0):
+    # Vanilla ViT-Small/16 style config
+    return VisionTransformer(
+        image_size=image_size,
+        patch_size=patch_size,
+        num_layers=12,
+        num_heads=6,
+        hidden_dim=384,
+        mlp_dim=1536,
+        dropout=dropout,
+        attention_dropout=attention_dropout,
+        num_classes=num_classes,
+    )
+
+
 def main():
-    parser = argparse.ArgumentParser("ImageNet training for Rot2DTransformerV2")
+    parser = argparse.ArgumentParser("ImageNet training for vanilla ViT-Small")
     parser.add_argument("--data-root", type=str, required=True)
-    parser.add_argument("--output-dir", type=str, default="imagenet_es_v2_outputs")
+    parser.add_argument("--output-dir", type=str, default="imagenet_vit_small_outputs")
     parser.add_argument("--epochs", type=int, default=300)
     parser.add_argument("--warmup-epochs", type=int, default=20)
-    parser.add_argument("--batch-size", type=int, default=256, help="Per-GPU batch size in DDP mode")
+    parser.add_argument("--batch-size", type=int, default=128, help="Per-GPU batch size in DDP mode")
     parser.add_argument("--num-workers", type=int, default=8)
 
-    parser.add_argument("--lr", type=float, default=1e-3)
+    parser.add_argument("--lr", type=float, default=3e-4)
     parser.add_argument("--weight-decay", type=float, default=0.05)
     parser.add_argument("--grad-clip", type=float, default=1.0)
     parser.add_argument("--label-smoothing", type=float, default=0.1)
     parser.add_argument("--seed", type=int, default=42)
 
-    parser.add_argument("--group-str", type=str, default='C4')
-    parser.add_argument(
-        "--model-size",
-        type=str,
-        default="tiny",
-        choices=["tiny", "small-D4", "small", "base"],
-    )
-    parser.add_argument("--dims", type=int, nargs=4, default=None, help="Override stage dims")
-    parser.add_argument("--depths", type=int, nargs=4, default=None, help="Override stage depths")
-    parser.add_argument("--heads", type=int, nargs=4, default=None, help="Override stage heads")
-    parser.add_argument("--window-size", type=int, default=7)
-    parser.add_argument("--mlp-ratio", type=int, default=4)
+    parser.add_argument("--image-size", type=int, default=224)
+    parser.add_argument("--patch-size", type=int, default=16)
     parser.add_argument("--dropout", type=float, default=0.0)
     parser.add_argument("--attn-dropout", type=float, default=0.0)
-    parser.add_argument("--drop-path-rate", type=float, default=0.1)
-    parser.add_argument("--qkv-kernel-size", type=int, default=1)
-    parser.add_argument("--use-checkpoint", action="store_true")
-    parser.add_argument("--fast-init", action="store_true", help="Use faster non-basis-aware init for R2Conv")
 
     parser.add_argument("--ddp", action="store_true", help="Use DDP (launch via torchrun)")
     parser.add_argument("--data-parallel", action="store_true", help="Use DataParallel when not using DDP")
 
-    parser.add_argument(
-        "--pretrained",
-        action="store_true",
-        help="Load weights from --pretrained-path before training (and resume optimizer/scheduler unless --pretrained-weights-only)",
-    )
-    parser.add_argument(
-        "--pretrained-path",
-        type=str,
-        default=None,
-        help="Path to .pt checkpoint (same format as training saves: model_state_dict, optional optimizer/scheduler)",
-    )
-    parser.add_argument(
-        "--pretrained-weights-only",
-        action="store_true",
-        help="Only load model weights; new optimizer/scheduler, start at epoch 0",
-    )
-
     args = parser.parse_args()
-    if args.pretrained and not args.pretrained_path:
-        parser.error("--pretrained-path is required when --pretrained is set")
     seed_everything(args.seed)
-
-    # ViT-tiny-like default capacity (unless explicitly overridden)
-    presets = {
-        "tiny": {"dims": [12, 24, 48, 96], "depths": [1, 2, 3, 1], "heads": [1, 2, 4, 8]},
-        "small-D4": {"dims": [24, 48, 96, 192], "depths": [1, 2, 4, 1], "heads": [1, 2, 4, 8]},
-        "small": {"dims": [32, 64, 128, 256], "depths": [1, 2, 4, 1], "heads": [1, 2, 4, 8]},
-        "base": {"dims": [64, 128, 256, 512], "depths": [2, 2, 6, 2], "heads": [2, 4, 8, 16]},
-    }
-    preset = presets[args.model_size]
-    if args.dims is None:
-        args.dims = preset["dims"]
-    if args.depths is None:
-        args.depths = preset["depths"]
-    if args.heads is None:
-        args.heads = preset["heads"]
 
     rank, _, local_rank = setup_distributed()
     use_ddp = args.ddp and rank is not None
@@ -273,32 +239,13 @@ def main():
         use_ddp=use_ddp,
     )
 
-    # gspace = gspaces.rot2dOnR2(N=args.group_n)
-    gspace = get_gspace(args.group_str)
-    model = Rot2DTransformerV2(
-        gspace=gspace,
-        in_channels=3,
+    model = build_vit_small(
         num_classes=1000,
-        dims=tuple(args.dims),
-        depths=tuple(args.depths),
-        heads=tuple(args.heads),
-        window_size=args.window_size,
-        mlp_ratio=args.mlp_ratio,
+        image_size=args.image_size,
+        patch_size=args.patch_size,
         dropout=args.dropout,
-        attn_dropout=args.attn_dropout,
-        drop_path_rate=args.drop_path_rate,
-        qkv_kernel_size=args.qkv_kernel_size,
-        use_checkpoint=args.use_checkpoint,
-        fast_init=args.fast_init,
+        attention_dropout=args.attn_dropout,
     ).to(device)
-
-    resume_ckpt = None
-    if args.pretrained:
-        if not os.path.isfile(args.pretrained_path):
-            raise FileNotFoundError(f"--pretrained-path not found: {args.pretrained_path}")
-        resume_ckpt = load_pretrained_weights(model, args.pretrained_path, device)
-        if is_main_process(rank):
-            print(f"Loaded pretrained weights from {args.pretrained_path}")
 
     if use_ddp:
         model = DDP(model, device_ids=[local_rank], output_device=local_rank)
@@ -309,8 +256,8 @@ def main():
         count_parameters(model)
         os.makedirs(args.output_dir, exist_ok=True)
         os.makedirs(os.path.join(args.output_dir, "checkpoints"), exist_ok=True)
-        # os.makedirs(os.path.join(args.output_dir, "runs"), exist_ok=True)
-        writer = SummaryWriter(log_dir=os.path.join(args.output_dir, "runs", f"imagenet_es_v2_{args.model_size}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"))
+        run_id = datetime.now().strftime("%Y%m%d_%H%M%S")
+        writer = SummaryWriter(log_dir=os.path.join(args.output_dir, "runs", f"imagenet_vit_small_{run_id}"))
     else:
         writer = None
 
@@ -320,32 +267,11 @@ def main():
     scheduler = SequentialLR(optimizer, schedulers=[warmup_scheduler, cosine_scheduler], milestones=[args.warmup_epochs])
     scaler = torch.amp.GradScaler("cuda" if device.type == "cuda" else "cpu", enabled=device.type == "cuda")
 
-    start_epoch = 0
     best_top1 = 0.0
     best_epoch = -1
-    if (
-        args.pretrained
-        and resume_ckpt is not None
-        and not args.pretrained_weights_only
-        and "optimizer_state_dict" in resume_ckpt
-        and "scheduler_state_dict" in resume_ckpt
-    ):
-        optimizer.load_state_dict(resume_ckpt["optimizer_state_dict"])
-        scheduler.load_state_dict(resume_ckpt["scheduler_state_dict"])
-        start_epoch = int(resume_ckpt.get("epoch", -1)) + 1
-        best_top1 = float(resume_ckpt.get("top1", 0.0))
-        best_epoch = int(resume_ckpt.get("epoch", -1))
-        if is_main_process(rank):
-            print(f"Resuming training from epoch {start_epoch} (loaded optimizer and scheduler)")
-    elif args.pretrained and resume_ckpt is not None and not args.pretrained_weights_only and is_main_process(rank):
-        if "optimizer_state_dict" not in resume_ckpt or "scheduler_state_dict" not in resume_ckpt:
-            print(
-                "Checkpoint has no optimizer/scheduler state; training from epoch 0 with new optimizer/scheduler"
-            )
-
     best_state = None
 
-    for epoch in range(start_epoch, start_epoch + args.epochs):
+    for epoch in range(args.epochs):
         if train_sampler is not None:
             train_sampler.set_epoch(epoch)
 
@@ -388,7 +314,7 @@ def main():
                         "scheduler_state_dict": scheduler.state_dict(),
                         "top1": best_top1,
                     },
-                    os.path.join(args.output_dir, "checkpoints", f"imagenet_es_v2_best_epoch_{best_epoch}.pt"),
+                    os.path.join(args.output_dir, "checkpoints", f"imagenet_vit_small_best_epoch_{best_epoch}.pt"),
                 )
 
     if is_main_process(rank):
@@ -396,7 +322,7 @@ def main():
         if best_state is not None:
             torch.save(
                 best_state,
-                os.path.join(args.output_dir, f"imagenet_es_v2_best_top1_{best_top1:.4f}_epoch_{best_epoch}.pth"),
+                os.path.join(args.output_dir, f"imagenet_vit_small_best_top1_{best_top1:.4f}_epoch_{best_epoch}.pth"),
             )
             print(f"Best top1={best_top1:.4f} at epoch={best_epoch}")
 
