@@ -1,4 +1,4 @@
-# REViT — Roto-Reflection Equivariant convolutional Vision Transformer
+# REViT — Roto-reflection Equivariant convolutional Vision Transformer
 
 REViT is a research codebase for rotation/roto-reflection equivariant vision transformers. It contains:
 
@@ -170,6 +170,19 @@ tensorboard --logdir imagenet_es_v2_outputs/runs
 tensorboard --logdir imagenet_vit_small_outputs/runs
 ```
 
+## Citation
+
+```tex
+@inproceedings{
+zaheer2026revit,
+title={{REV}iT: Roto-reflection Equivariant Convolutional Vision Transformer},
+author={Anonymous},
+booktitle={Forty-third International Conference on Machine Learning},
+year={2026},
+url={https://openreview.net/forum?id=n2RIMdIbv6}
+}
+
+```
 
 ## License
 
