@@ -244,8 +244,8 @@ def main():
     # ViT-tiny-like default capacity (unless explicitly overridden)
     presets = {
         "tiny": {"dims": [12, 24, 48, 96], "depths": [1, 2, 3, 1], "heads": [1, 2, 4, 8]},
-        "small-D4": {"dims": [24, 48, 96, 192], "depths": [1, 2, 4, 1], "heads": [1, 2, 4, 8]},
-        "small": {"dims": [32, 64, 128, 256], "depths": [1, 2, 4, 1], "heads": [1, 2, 4, 8]},
+        "small": {"dims": [24, 48, 96, 192], "depths": [1, 2, 4, 1], "heads": [1, 2, 4, 8]},
+        "medium": {"dims": [32, 64, 128, 256], "depths": [1, 2, 4, 1], "heads": [1, 2, 4, 8]},
         "base": {"dims": [64, 128, 256, 512], "depths": [2, 2, 6, 2], "heads": [2, 4, 8, 16]},
     }
     preset = presets[args.model_size]
