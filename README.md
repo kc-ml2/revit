@@ -24,7 +24,6 @@ REViT is a research codebase for rotation/roto-reflection equivariant vision tra
 - `datasets/rot_mnist.py`: rotated MNIST dataset class and dataloaders.
 - `datasets/cifar10.py`: CIFAR-10 dataloaders and augmentation.
 - `datasets/pcam.py`: PCam dataloaders.
-- `datasets/__init__.py`: dataset loader exports.
 
 ## Supported symmetry groups
 
@@ -90,7 +89,7 @@ Single GPU:
 ```bash
 python imagenet_train_revit.py \
   --data-root /path/to/imagenet \
-  --model-size small-D4 \
+  --model-size small \
   --group-str D4 \
   --batch-size 128 \
   --epochs 300 \
@@ -108,7 +107,7 @@ Multi GPU (DDP):
 torchrun --standalone --nproc_per_node=4 imagenet_train_revit.py \
   --ddp \
   --data-root /path/to/imagenet \
-  --model-size small-D4 \
+  --model-size small \
   --group-str D4 \
   --batch-size 128 \
   --epochs 300 \
@@ -172,15 +171,13 @@ tensorboard --logdir imagenet_vit_small_outputs/runs
 ## Citation
 
 ```tex
-@inproceedings{
-zaheer2026revit,
+@inproceedings{zaheer2026revit,
 title={{REV}iT: Roto-reflection Equivariant Convolutional Vision Transformer},
 author={Zaheer, Sheir A. and Holston, Alexander C. and Park, Chan Y.},
 booktitle={Forty-third International Conference on Machine Learning},
 year={2026},
 url={https://openreview.net/forum?id=n2RIMdIbv6}
 }
-
 ```
 
 ## License
