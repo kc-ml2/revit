@@ -202,7 +202,7 @@ def main():
         "--model-size",
         type=str,
         default="tiny",
-        choices=["tiny", "small-D4", "small", "base"],
+        choices=["tiny", "small", "medium", "base"],
     )
     parser.add_argument("--dims", type=int, nargs=4, default=None, help="Override stage dims")
     parser.add_argument("--depths", type=int, nargs=4, default=None, help="Override stage depths")
@@ -396,7 +396,7 @@ def main():
         if best_state is not None:
             torch.save(
                 best_state,
-                os.path.join(args.output_dir, f"imagenet_es_v2_best_top1_{best_top1:.4f}_epoch_{best_epoch}.pth"),
+                os.path.join(args.output_dir, f"imagenet_revit_{args.group_str}_{args.model_size}_best_top1_{best_top1:.4f}_epoch_{best_epoch}.pth"),
             )
             print(f"Best top1={best_top1:.4f} at epoch={best_epoch}")
 
