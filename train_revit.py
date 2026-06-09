@@ -183,8 +183,8 @@ if __name__ == "__main__":
     dataset = 'rotmnist'     # 'cifar10' or 'pcam' or 'rotmnist'
     group_str = "C4"
     depth = 4
-    channels = 12
-    heads = 6
+    channels = 12    # this scales with group cardinality, so adjust if you want to change the group size without icreasing parameters
+    heads = 6 
     num_epochs = 300
     warmup_epochs = 30
     patience = 20

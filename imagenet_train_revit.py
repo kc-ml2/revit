@@ -310,7 +310,7 @@ def main():
         os.makedirs(args.output_dir, exist_ok=True)
         os.makedirs(os.path.join(args.output_dir, "checkpoints"), exist_ok=True)
         # os.makedirs(os.path.join(args.output_dir, "runs"), exist_ok=True)
-        writer = SummaryWriter(log_dir=os.path.join(args.output_dir, "runs", f"imagenet_es_v2_{args.model_size}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"))
+        writer = SummaryWriter(log_dir=os.path.join(args.output_dir, "runs", f"imagenet_revit_{args.group_str}_{args.model_size}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"))
     else:
         writer = None
 
