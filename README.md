@@ -171,9 +171,10 @@ tensorboard --logdir imagenet_vit_small_outputs/runs
 ## Citation
 
 ```tex
-@inproceedings{zaheer2026revit,
+@inproceedings{
+zaheer2026revit,
 title={{REV}iT: Roto-reflection Equivariant Convolutional Vision Transformer},
-author={Zaheer, Sheir A. and Holston, Alexander C. and Park, Chan Y.},
+author={Sheir A. Zaheer and Alexander C. Holston and Chan Y. Park},
 booktitle={Forty-third International Conference on Machine Learning},
 year={2026},
 url={https://openreview.net/forum?id=n2RIMdIbv6}
