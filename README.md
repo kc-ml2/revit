@@ -168,6 +168,10 @@ tensorboard --logdir imagenet_es_v2_outputs/runs
 tensorboard --logdir imagenet_vit_small_outputs/runs
 ```
 
+## Model Zoo
+
+Pretrained model weights are available [here](https://drive.google.com/drive/folders/1iulEWyquORbqyRt0sNTawzFB57GbrhQu?usp=sharing).
+
 ## Citation
 
 ```tex
