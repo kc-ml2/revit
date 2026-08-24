@@ -52,14 +52,14 @@ class Rot2DStem(nn.Module):
         self.bn1 = InnerBatchNorm(mid_type)
         self.act1 = ReLU(mid_type)
 
-        self.conv2 = R2Conv(mid_type, out_type, kernel_size=3, stride=2, padding=1, bias=False)
+        self.conv2 = R2Conv(mid_type, out_type, kernel_size=3, stride=2, padding=1, bias=False)           
         self.bn2 = InnerBatchNorm(out_type)
         self.act2 = ReLU(out_type)
 
     def forward(self, x: torch.Tensor) -> GeometricTensor:
         x = GeometricTensor(x, self.in_type)
         x = self.act1(self.bn1(self.conv1(x)))
-        x = self.act2(self.bn2(self.conv2(x)))
+        x = self.act2(self.bn2(self.conv2(x)))   
         return x
 
 
@@ -279,7 +279,7 @@ class Rot2DTransformerV2(nn.Module):
         fast_init: bool = False,
     ):
         super().__init__()
-        assert len(dims) == len(depths) == len(heads) == 4
+        assert len(dims) == len(depths) == len(heads)
         self.gspace = gspace
         self.fast_init = fast_init
 
@@ -291,7 +291,7 @@ class Rot2DTransformerV2(nn.Module):
         dpr_idx = 0
         stages = []
 
-        for i in range(4):
+        for i in range(len(dims)):
             blocks = []
             for _ in range(depths[i]):
                 blocks.append(
@@ -309,7 +309,7 @@ class Rot2DTransformerV2(nn.Module):
                 )
                 dpr_idx += 1
 
-            downsample = Rot2DDownsample(stage_types[i], stage_types[i + 1]) if i < 3 else None
+            downsample = Rot2DDownsample(stage_types[i], stage_types[i + 1]) if i < (len(dims) - 1) else None
             stages.append(Rot2DStage(nn.ModuleList(blocks), downsample))
 
         self.stages = nn.ModuleList(stages)
