@@ -3,6 +3,7 @@ from typing import Optional, Tuple
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import torch.utils.checkpoint as checkpoint
 from escnn import gspaces
 from escnn.nn import (
@@ -93,6 +94,10 @@ class Rot2DWindowAttention(nn.Module):
         self.window_size = window_size
         self.head_size = len(in_type.representations) // num_heads
         self.head_dim = self.head_size * in_type.representations[0].size
+        # benchmark (benchmark_results/sdpa_bench_1361213.json): SDPA is 0-4% slower
+        # here — 7x7 windows are too small for fused kernels to win — so bmm stays
+        # the default. Global attention (revit_gcsa.py) defaults to SDPA instead.
+        self.use_sdpa = False
 
         pad = (qkv_kernel_size - 1) // 2
         self.to_q = R2Conv(in_type, in_type, qkv_kernel_size, padding=pad, bias=False)
@@ -140,11 +145,20 @@ class Rot2DWindowAttention(nn.Module):
         kh = kw.view(bnw, self.num_heads, self.head_dim, n).transpose(-2, -1)
         vh = vw.view(bnw, self.num_heads, self.head_dim, n).transpose(-2, -1)
 
-        attn = torch.matmul(qh, kh.transpose(-2, -1)) / math.sqrt(self.head_dim)
-        attn = attn - attn.amax(dim=-1, keepdim=True)
-        attn = torch.softmax(attn, dim=-1)
-        attn = self.attn_dropout(attn)
-        out = torch.matmul(attn, vh).transpose(-2, -1).contiguous().view(bnw, c, ws, ws)
+        if self.use_sdpa:
+            # same math as below; scale defaults to 1/sqrt(head_dim).
+            # contiguous: fused SDPA kernels require stride-1 last dim, else silent math fallback
+            out = F.scaled_dot_product_attention(
+                qh.contiguous(), kh.contiguous(), vh.contiguous(),
+                dropout_p=self.attn_dropout.p if self.training else 0.0,
+            )
+        else:
+            attn = torch.matmul(qh, kh.transpose(-2, -1)) / math.sqrt(self.head_dim)
+            attn = attn - attn.amax(dim=-1, keepdim=True)
+            attn = torch.softmax(attn, dim=-1)
+            attn = self.attn_dropout(attn)
+            out = torch.matmul(attn, vh)
+        out = out.transpose(-2, -1).contiguous().view(bnw, c, ws, ws)
 
         out = self._window_reverse(out, meta)
         out = GeometricTensor(out, self.in_type)
