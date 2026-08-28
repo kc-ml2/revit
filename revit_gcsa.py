@@ -1,5 +1,6 @@
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from escnn import gspaces
 from torch.amp import autocast
 from escnn.nn import (
@@ -15,6 +16,21 @@ def count_parameters(model):
     print(f"Total Parameters: {total_params}")
     print(f"Trainable Parameters: {trainable_params}")
     return total_params, trainable_params
+
+
+def _sdpa_spatial(q, k, v, num_heads, dropout_p):
+    # q, k, v: [B, C, H, W] plain tensors, group fiber folded into C.
+    # Batched equivalent of the per-head bmm loop: chunk(num_heads, dim=1)
+    # == view(B, num_heads, C // num_heads, ...), and SDPA's default scale
+    # is 1/sqrt(C // num_heads), matching the explicit head_dim ** 0.5.
+    B, C, H, W = q.shape
+    hd = C // num_heads
+    # contiguous: fused SDPA kernels require stride-1 last dim, else silent math fallback
+    qf = q.view(B, num_heads, hd, H * W).transpose(-2, -1).contiguous()
+    kf = k.view(B, num_heads, hd, H * W).transpose(-2, -1).contiguous()
+    vf = v.view(B, num_heads, hd, H * W).transpose(-2, -1).contiguous()
+    out = F.scaled_dot_product_attention(qf, kf, vf, dropout_p=dropout_p)
+    return out.transpose(-2, -1).reshape(B, C, H, W)
 
 
 class Rot2DLifting(nn.Module):
@@ -85,6 +101,7 @@ class Rot2DMultiHeadAttention(nn.Module):
 
         self.attn_dropout = nn.Dropout(attn_dropout)
         self.dropout = PointwiseDropout(in_type, dropout)
+        self.use_sdpa = True
 
     def _split_heads(self, x):
         chunks = x.tensor.chunk(self.num_heads, dim=1)
@@ -94,6 +111,14 @@ class Rot2DMultiHeadAttention(nn.Module):
         q = self.to_q(x)
         k = self.to_k(x)
         v = self.to_v(x)
+
+        if self.use_sdpa:
+            out = _sdpa_spatial(
+                q.tensor, k.tensor, v.tensor, self.num_heads,
+                self.attn_dropout.p if self.training else 0.0,
+            )
+            out = GeometricTensor(out, self.in_type)
+            return self.dropout(self.to_out(out))
 
         qh = self._split_heads(q)
         kh = self._split_heads(k)
@@ -184,6 +209,7 @@ class Rot2DConvMultiHeadAttention(nn.Module):
 
         self.attn_dropout = nn.Dropout(attn_dropout)
         self.dropout = PointwiseDropout(in_type, dropout)
+        self.use_sdpa = True
 
     def _split_heads(self, x):
         """Split the channel dimension into multiple heads"""
@@ -205,6 +231,14 @@ class Rot2DConvMultiHeadAttention(nn.Module):
         q = self.to_q(x)
         k = self.to_k(x)
         v = self.to_v(x)
+
+        if self.use_sdpa:
+            out = _sdpa_spatial(
+                q.tensor, k.tensor, v.tensor, self.num_heads,
+                self.attn_dropout.p if self.training else 0.0,
+            )
+            out = GeometricTensor(out, self.in_type)
+            return self.dropout(self.to_out(out))
 
         # Split into multiple heads
         qh = self._split_heads(q)
