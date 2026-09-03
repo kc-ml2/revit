@@ -43,25 +43,34 @@ class DropPath(nn.Module):
 
 
 class Rot2DStem(nn.Module):
-    def __init__(self, gspace, in_channels: int, out_type: FieldType):
+    def __init__(self, gspace, in_channels: int, out_type: FieldType, downsample: int = 4):
         super().__init__()
+        if downsample not in (2, 4, 8):
+            raise ValueError(f"downsample must be 2, 4, or 8, got {downsample}")
+        self.downsample = downsample
+        # One stride-2 layer per 2x; default 2 layers keeps the original 4x stem.
+        n_layers = {2: 1, 4: 2, 8: 3}[downsample]
+
         self.in_type = FieldType(gspace, in_channels * [gspace.trivial_repr])
         mid = max(1, len(out_type.representations) // 2)
         mid_type = FieldType(gspace, mid * [gspace.regular_repr])
 
-        self.conv1 = R2Conv(self.in_type, mid_type, kernel_size=5, stride=2, padding=2, bias=False)
-        self.bn1 = InnerBatchNorm(mid_type)
-        self.act1 = ReLU(mid_type)
-
-        self.conv2 = R2Conv(mid_type, out_type, kernel_size=3, stride=2, padding=1, bias=False)           
-        self.bn2 = InnerBatchNorm(out_type)
-        self.act2 = ReLU(out_type)
+        layers = []
+        for i in range(n_layers):
+            if i == 0:
+                in_t, k, pad = self.in_type, 5, 2
+            else:
+                in_t, k, pad = mid_type, 3, 1
+            out_t = out_type if i == n_layers - 1 else mid_type
+            layers.extend([
+                R2Conv(in_t, out_t, kernel_size=k, stride=2, padding=pad, bias=False),
+                InnerBatchNorm(out_t),
+                ReLU(out_t),
+            ])
+        self.net = nn.Sequential(*layers)
 
     def forward(self, x: torch.Tensor) -> GeometricTensor:
-        x = GeometricTensor(x, self.in_type)
-        x = self.act1(self.bn1(self.conv1(x)))
-        x = self.act2(self.bn2(self.conv2(x)))   
-        return x
+        return self.net(GeometricTensor(x, self.in_type))
 
 
 class Rot2DDownsample(nn.Module):
@@ -291,6 +300,7 @@ class Rot2DTransformerV2(nn.Module):
         qkv_kernel_size: int = 1,
         use_checkpoint: bool = False,
         fast_init: bool = False,
+        stem_downsample: int = 4,
     ):
         super().__init__()
         assert len(dims) == len(depths) == len(heads)
@@ -298,7 +308,7 @@ class Rot2DTransformerV2(nn.Module):
         self.fast_init = fast_init
 
         stage_types = [FieldType(gspace, d * [gspace.regular_repr]) for d in dims]
-        self.stem = Rot2DStem(gspace, in_channels, stage_types[0])
+        self.stem = Rot2DStem(gspace, in_channels, stage_types[0], downsample=stem_downsample)
 
         total_blocks = sum(depths)
         dpr = torch.linspace(0, drop_path_rate, total_blocks).tolist()
