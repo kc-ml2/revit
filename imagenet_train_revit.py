@@ -1,5 +1,4 @@
 import argparse
-import copy
 import os
 import random
 from datetime import datetime
@@ -7,16 +6,52 @@ import numpy as np
 import torch
 import torch.distributed as dist
 import torch.nn as nn
+import torch.nn.functional as F
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.optim.lr_scheduler import CosineAnnealingLR, LinearLR, SequentialLR
 from torch.utils.data import DataLoader
 from torch.utils.data.distributed import DistributedSampler
 from torch.utils.tensorboard import SummaryWriter
 from torchvision import datasets, transforms
+from torchvision.transforms import v2 as T_v2
 from tqdm import tqdm
 from group_space import get_gspace
 
 from revit_windowed_gcsa import Rot2DTransformerV2, count_parameters
+
+
+class SoftTargetCrossEntropy(nn.Module):
+    """Cross-entropy for soft labels from Mixup/CutMix."""
+
+    def forward(self, pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+        return torch.sum(-target * F.log_softmax(pred, dim=-1), dim=-1).mean()
+
+
+def build_mixup_cutmix(num_classes: int, mixup_alpha: float, cutmix_alpha: float, switch_prob: float):
+    """Return a batch transform that randomly applies Mixup or CutMix, or None if both disabled."""
+    ops = []
+    probs = []
+    if mixup_alpha > 0.0:
+        ops.append(T_v2.MixUp(num_classes=num_classes, alpha=mixup_alpha))
+        probs.append(switch_prob if cutmix_alpha > 0.0 else 1.0)
+    if cutmix_alpha > 0.0:
+        ops.append(T_v2.CutMix(num_classes=num_classes, alpha=cutmix_alpha))
+        probs.append((1.0 - switch_prob) if mixup_alpha > 0.0 else 1.0)
+    if not ops:
+        return None
+    if len(ops) == 1:
+        return ops[0]
+    total = sum(probs)
+    probs = [p / total for p in probs]
+    return T_v2.RandomChoice(ops, p=probs)
+
+
+def apply_mixup_cutmix(mixup_fn, x: torch.Tensor, y: torch.Tensor, mixup_prob: float):
+    """Maybe apply Mixup/CutMix. Returns (x, y, used_soft_targets)."""
+    if mixup_fn is None or mixup_prob <= 0.0 or random.random() >= mixup_prob:
+        return x, y, False
+    x, y = mixup_fn(x, y)
+    return x, y, True
 
 
 def seed_everything(seed: int = 42):
@@ -55,6 +90,35 @@ def _strip_module_prefix(state_dict):
     return state_dict
 
 
+def _to_cpu(obj):
+    if torch.is_tensor(obj):
+        return obj.detach().cpu()
+    if isinstance(obj, dict):
+        return {k: _to_cpu(v) for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [_to_cpu(v) for v in obj]
+    if isinstance(obj, tuple):
+        return tuple(_to_cpu(v) for v in obj)
+    return obj
+
+
+def save_training_checkpoint(path, model, optimizer, scheduler, epoch, top1, device):
+    """Write checkpoint from CPU tensors so rank 0 does not spike GPU memory."""
+    if device.type == "cuda":
+        torch.cuda.synchronize()
+    payload = {
+        "epoch": epoch,
+        "top1": top1,
+        "model_state_dict": _to_cpu(model.state_dict()),
+        "optimizer_state_dict": _to_cpu(optimizer.state_dict()),
+        "scheduler_state_dict": _to_cpu(scheduler.state_dict()),
+    }
+    torch.save(payload, path)
+    del payload
+    if device.type == "cuda":
+        torch.cuda.empty_cache()
+
+
 def load_pretrained_weights(model: nn.Module, path: str, device: torch.device) -> dict:
     ckpt = torch.load(path, map_location=device, weights_only=False)
     if "model_state_dict" not in ckpt:
@@ -63,20 +127,36 @@ def load_pretrained_weights(model: nn.Module, path: str, device: torch.device) -
     return ckpt
 
 
-def get_imagenet_loaders(data_root, batch_size=256, num_workers=8, use_ddp=False):
+def get_imagenet_loaders(
+    data_root,
+    batch_size=256,
+    num_workers=8,
+    use_ddp=False,
+    color_jitter=True,
+    randaugment=True,
+    randaugment_num_ops=2,
+    randaugment_magnitude=9,
+    random_erase=0.25,
+):
     train_dir = os.path.join(data_root, "train")
     val_dir = os.path.join(data_root, "val")
 
     normalize = transforms.Normalize(mean=(0.485, 0.456, 0.406), std=(0.229, 0.224, 0.225))
-    train_tfms = transforms.Compose(
-        [
-            transforms.RandomResizedCrop(224, scale=(0.08, 1.0)),
-            # transforms.RandomHorizontalFlip(),
-            transforms.ColorJitter(0.4, 0.4, 0.4, 0.1),
-            transforms.ToTensor(),
-            normalize,
-        ]
-    )
+    train_list = [
+        transforms.RandomResizedCrop(224, scale=(0.08, 1.0)),
+        # RandomHorizontalFlip omitted: redundant under D4 / reflection groups.
+    ]
+    if randaugment:
+        train_list.append(
+            transforms.RandAugment(num_ops=randaugment_num_ops, magnitude=randaugment_magnitude)
+        )
+    if color_jitter:
+        train_list.append(transforms.ColorJitter(0.4, 0.4, 0.4, 0.1))
+    train_list.extend([transforms.ToTensor(), normalize])
+    if random_erase > 0.0:
+        train_list.append(transforms.RandomErasing(p=random_erase, value="random"))
+    train_tfms = transforms.Compose(train_list)
+
     val_tfms = transforms.Compose(
         [
             transforms.Resize(256),
@@ -103,7 +183,7 @@ def get_imagenet_loaders(data_root, batch_size=256, num_workers=8, use_ddp=False
     )
     val_loader = DataLoader(
         val_ds,
-        batch_size=batch_size * 2,
+        batch_size=batch_size,
         shuffle=False,
         sampler=val_sampler,
         num_workers=num_workers,
@@ -113,9 +193,22 @@ def get_imagenet_loaders(data_root, batch_size=256, num_workers=8, use_ddp=False
     return train_loader, val_loader, train_sampler
 
 
-def train_one_epoch(model, loader, optimizer, scaler, device, epoch, rank, grad_clip=1.0, label_smoothing=0.1):
+def train_one_epoch(
+    model,
+    loader,
+    optimizer,
+    scaler,
+    device,
+    epoch,
+    rank,
+    grad_clip=1.0,
+    label_smoothing=0.1,
+    mixup_fn=None,
+    mixup_prob=1.0,
+):
     model.train()
-    criterion = nn.CrossEntropyLoss(label_smoothing=label_smoothing)
+    hard_criterion = nn.CrossEntropyLoss(label_smoothing=label_smoothing)
+    soft_criterion = SoftTargetCrossEntropy()
     total_loss = 0.0
     steps = 0
 
@@ -123,11 +216,15 @@ def train_one_epoch(model, loader, optimizer, scaler, device, epoch, rank, grad_
     for x, y in pbar:
         x = x.to(device, non_blocking=True)
         y = y.to(device, non_blocking=True)
+        x, y, soft = apply_mixup_cutmix(mixup_fn, x, y, mixup_prob)
+        if soft and label_smoothing > 0.0:
+            # Mild label smoothing on already-mixed soft targets (DeiT-style).
+            y = y * (1.0 - label_smoothing) + label_smoothing / y.size(-1)
 
         optimizer.zero_grad(set_to_none=True)
         with torch.autocast(device_type="cuda" if device.type == "cuda" else "cpu", dtype=torch.float16, enabled=device.type == "cuda"):
             out = model(x)
-            loss = criterion(out, y)
+            loss = soft_criterion(out, y) if soft else hard_criterion(out, y)
 
         scaler.scale(loss).backward()
         scaler.unscale_(optimizer)
@@ -197,12 +294,29 @@ def main():
     parser.add_argument("--label-smoothing", type=float, default=0.1)
     parser.add_argument("--seed", type=int, default=42)
 
+    # DeiT-style augmentations (defaults on; set magnitudes/probs to 0 or use --no-* to disable)
+    parser.add_argument("--color-jitter", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--randaugment", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--randaugment-num-ops", type=int, default=2)
+    parser.add_argument("--randaugment-magnitude", type=int, default=9)
+    parser.add_argument("--random-erase", type=float, default=0.25, help="RandomErasing probability (0 disables)")
+    parser.add_argument("--mixup", type=float, default=0.8, help="Mixup alpha (0 disables)")
+    parser.add_argument("--cutmix", type=float, default=1.0, help="CutMix alpha (0 disables)")
+    parser.add_argument("--mixup-prob", type=float, default=1.0, help="Probability of applying Mixup/CutMix per batch")
+    parser.add_argument(
+        "--mixup-switch-prob",
+        type=float,
+        default=0.5,
+        help="Probability of choosing Mixup vs CutMix when both are enabled",
+    )
+    parser.add_argument("--num-classes", type=int, default=1000)
+
     parser.add_argument("--group-str", type=str, default='C4')
     parser.add_argument(
         "--model-size",
         type=str,
         default="tiny",
-        choices=["tiny", "small", "medium", "base"],
+        choices=["tiny", "small", "base", "large"],
     )
     parser.add_argument("--dims", type=int, nargs=4, default=None, help="Override stage dims")
     parser.add_argument("--depths", type=int, nargs=4, default=None, help="Override stage depths")
@@ -245,8 +359,8 @@ def main():
     presets = {
         "tiny": {"dims": [12, 24, 48, 96], "depths": [1, 2, 3, 1], "heads": [1, 2, 4, 8]},
         "small": {"dims": [24, 48, 96, 192], "depths": [1, 2, 4, 1], "heads": [1, 2, 4, 8]},
-        "medium": {"dims": [32, 64, 128, 256], "depths": [1, 2, 4, 1], "heads": [1, 2, 4, 8]},
-        "base": {"dims": [64, 128, 256, 512], "depths": [2, 2, 6, 2], "heads": [2, 4, 8, 16]},
+        "base": {"dims": [32, 64, 128, 256], "depths": [2, 2, 4, 2], "heads": [1, 2, 4, 8]},
+        "large": {"dims": [64, 128, 192, 384], "depths": [2, 2, 6, 2], "heads": [2, 4, 8, 16]},
     }
     preset = presets[args.model_size]
     if args.dims is None:
@@ -271,14 +385,35 @@ def main():
         batch_size=args.batch_size,
         num_workers=args.num_workers,
         use_ddp=use_ddp,
+        color_jitter=args.color_jitter,
+        randaugment=args.randaugment,
+        randaugment_num_ops=args.randaugment_num_ops,
+        randaugment_magnitude=args.randaugment_magnitude,
+        random_erase=args.random_erase,
     )
+
+    mixup_fn = build_mixup_cutmix(
+        num_classes=args.num_classes,
+        mixup_alpha=args.mixup,
+        cutmix_alpha=args.cutmix,
+        switch_prob=args.mixup_switch_prob,
+    )
+    if is_main_process(rank):
+        print(
+            "Augmentations: "
+            f"color_jitter={args.color_jitter}, "
+            f"randaugment={args.randaugment}(ops={args.randaugment_num_ops},m={args.randaugment_magnitude}), "
+            f"random_erase={args.random_erase}, "
+            f"mixup={args.mixup}, cutmix={args.cutmix}, "
+            f"mixup_prob={args.mixup_prob}, switch_prob={args.mixup_switch_prob}"
+        )
 
     # gspace = gspaces.rot2dOnR2(N=args.group_n)
     gspace = get_gspace(args.group_str)
     model = Rot2DTransformerV2(
         gspace=gspace,
         in_channels=3,
-        num_classes=1000,
+        num_classes=args.num_classes,
         dims=tuple(args.dims),
         depths=tuple(args.depths),
         heads=tuple(args.heads),
@@ -343,7 +478,7 @@ def main():
                 "Checkpoint has no optimizer/scheduler state; training from epoch 0 with new optimizer/scheduler"
             )
 
-    best_state = None
+    best_ckpt_path = None
 
     for epoch in range(start_epoch, start_epoch + args.epochs):
         if train_sampler is not None:
@@ -362,6 +497,8 @@ def main():
             rank if use_ddp else None,
             grad_clip=args.grad_clip,
             label_smoothing=args.label_smoothing,
+            mixup_fn=mixup_fn,
+            mixup_prob=args.mixup_prob,
         )
         scheduler.step()
 
@@ -379,24 +516,29 @@ def main():
             if top1 > best_top1:
                 best_top1 = top1
                 best_epoch = epoch
-                best_state = copy.deepcopy(model.state_dict())
-                torch.save(
-                    {
-                        "epoch": best_epoch,
-                        "model_state_dict": model.state_dict(),
-                        "optimizer_state_dict": optimizer.state_dict(),
-                        "scheduler_state_dict": scheduler.state_dict(),
-                        "top1": best_top1,
-                    },
-                    os.path.join(args.output_dir, "checkpoints", f"imagenet_es_v2_best_epoch_{best_epoch}.pt"),
+                best_ckpt_path = os.path.join(
+                    args.output_dir, "checkpoints", f"imagenet_es_v2_best_epoch_{best_epoch}.pt"
+                )
+                save_training_checkpoint(
+                    best_ckpt_path,
+                    model,
+                    optimizer,
+                    scheduler,
+                    best_epoch,
+                    best_top1,
+                    device,
                 )
 
     if is_main_process(rank):
         writer.close()
-        if best_state is not None:
+        if best_ckpt_path is not None:
+            ckpt = torch.load(best_ckpt_path, map_location="cpu", weights_only=False)
             torch.save(
-                best_state,
-                os.path.join(args.output_dir, f"imagenet_revit_{args.group_str}_{args.model_size}_best_top1_{best_top1:.4f}_epoch_{best_epoch}.pth"),
+                ckpt["model_state_dict"],
+                os.path.join(
+                    args.output_dir,
+                    f"imagenet_revit_{args.group_str}_{args.model_size}_best_top1_{best_top1:.4f}_epoch_{best_epoch}.pth",
+                ),
             )
             print(f"Best top1={best_top1:.4f} at epoch={best_epoch}")
 

@@ -4,7 +4,7 @@
 REViT is a research codebase for rotation/roto-reflection equivariant vision transformers. It contains:
 
 - an equivariant transformer baseline (`Rot2DTransformer`) for small image datasets,
-- a windowed hierarchical equivariant transformer (`Rot2DTransformerV2`) for ImageNet-scale training,
+- a windowed hierarchical equivariant transformer (`Rot2DTransformerV2`) for ImageNet-scale training.
 
 ## Repository layout
 
@@ -17,7 +17,7 @@ REViT is a research codebase for rotation/roto-reflection equivariant vision tra
 ### Training scripts
 
 - `train_revit.py`: training entrypoint for `rotmnist`, `cifar10`, and `pcam` datasets.
-- `imagenet_train_revit.py`: ImageNet training for `Rot2DTransformerV2` (DDP, AMP, checkpoint resume).
+- `imagenet_train_revit.py`: ImageNet training for `Rot2DTransformerV2` (DDP, AMP, Mixup/CutMix, checkpoint resume).
 - `imagenet_train_vit.py`: ImageNet training for a vanilla `torchvision` ViT-Small baseline.
 
 ### Dataset utilities
@@ -25,6 +25,12 @@ REViT is a research codebase for rotation/roto-reflection equivariant vision tra
 - `datasets/rot_mnist.py`: rotated MNIST dataset class and dataloaders.
 - `datasets/cifar10.py`: CIFAR-10 dataloaders and augmentation.
 - `datasets/pcam.py`: PCam dataloaders.
+
+### Misc
+
+- `scripts/cleanup_checkpoints.py`: keep only the newest N checkpoint files in a directory.
+- `scripts/benchmark_sdpa.py`: compare bmm vs SDPA attention paths for latency/memory.
+- `requirements.txt` / `requirements-lock.txt`: install deps and optional pinned lockfile.
 
 ## Supported symmetry groups
 
@@ -147,10 +153,10 @@ torchrun --standalone --nproc_per_node=4 imagenet_train_vit.py \
 
 ## Model presets in `imagenet_train_revit.py`
 
-- `tiny`: dims `24,48,96,192`; depths `1,1,3,1`; heads `1,2,4,8`
+- `tiny` (default): dims `12,24,48,96`; depths `1,2,3,1`; heads `1,2,4,8`
 - `small`: dims `24,48,96,192`; depths `1,2,4,1`; heads `1,2,4,8`
-- `medium`: dims `32,64,128,256`; depths `1,2,4,1`; heads `1,2,4,8`
-- `base`: dims `64,128,256,512`; depths `2,2,6,2`; heads `2,4,8,16`
+- `base`: dims `32,64,128,256`; depths `2,2,4,2`; heads `1,2,4,8`
+- `large`: dims `64,128,192,384`; depths `2,2,6,2`; heads `2,4,8,16`
 
 You can override with `--dims`, `--depths`, and `--heads`.
 
