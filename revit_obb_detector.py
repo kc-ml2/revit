@@ -22,9 +22,26 @@ import math
 import os
 from typing import Dict, List, Optional, Sequence, Tuple
 
+import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+
+# ESCNN passes np.matrix into sklearn.randomized_svd; sklearn>=1.8 rejects that.
+try:
+    import escnn.group._numerical as _escnn_num
+
+    _orig_null = _escnn_num.null
+
+    def _null_compat(A, *args, **kwargs):
+        if isinstance(A, np.matrix):
+            A = np.asarray(A)
+        return _orig_null(A, *args, **kwargs)
+
+    _escnn_num.null = _null_compat
+except Exception:
+    pass
+
 from escnn.nn import FieldType, GeometricTensor, GroupPooling, InnerBatchNorm, R2Conv, ReLU, init
 
 from group_space import get_gspace
