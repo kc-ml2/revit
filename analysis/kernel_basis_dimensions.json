@@ -1,0 +1,82 @@
+[
+  {
+    "group": "Z2",
+    "order": 1,
+    "basis_regular_k1": 1,
+    "basis_regular_k3": 6,
+    "basis_regular_k5": 11,
+    "basis_lifting_k5": 11
+  },
+  {
+    "group": "D2",
+    "order": 2,
+    "basis_regular_k1": 2,
+    "basis_regular_k3": 12,
+    "basis_regular_k5": 22,
+    "basis_lifting_k5": 11
+  },
+  {
+    "group": "C4",
+    "order": 4,
+    "basis_regular_k1": 4,
+    "basis_regular_k3": 24,
+    "basis_regular_k5": 44,
+    "basis_lifting_k5": 11
+  },
+  {
+    "group": "D4",
+    "order": 8,
+    "basis_regular_k1": 8,
+    "basis_regular_k3": 48,
+    "basis_regular_k5": 88,
+    "basis_lifting_k5": 11
+  },
+  {
+    "group": "C8",
+    "order": 8,
+    "basis_regular_k1": 8,
+    "basis_regular_k3": 48,
+    "basis_regular_k5": 88,
+    "basis_lifting_k5": 11
+  },
+  {
+    "group": "D8",
+    "order": 16,
+    "basis_regular_k1": 16,
+    "basis_regular_k3": 96,
+    "basis_regular_k5": 176,
+    "basis_lifting_k5": 11
+  },
+  {
+    "group": "C12",
+    "order": 12,
+    "basis_regular_k1": 12,
+    "basis_regular_k3": 72,
+    "basis_regular_k5": 132,
+    "basis_lifting_k5": 11
+  },
+  {
+    "group": "D12",
+    "order": 24,
+    "basis_regular_k1": 24,
+    "basis_regular_k3": 144,
+    "basis_regular_k5": 264,
+    "basis_lifting_k5": 11
+  },
+  {
+    "group": "C16",
+    "order": 16,
+    "basis_regular_k1": 16,
+    "basis_regular_k3": 96,
+    "basis_regular_k5": 176,
+    "basis_lifting_k5": 11
+  },
+  {
+    "group": "D16",
+    "order": 32,
+    "basis_regular_k1": 32,
+    "basis_regular_k3": 192,
+    "basis_regular_k5": 352,
+    "basis_lifting_k5": 11
+  }
+]

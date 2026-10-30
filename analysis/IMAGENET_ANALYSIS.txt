@@ -1,0 +1,333 @@
+REViT ImageNet architecture, training, scaling and equivariance analysis
+Date: 2026-10-28
+Source revision examined: 2558962 (kc-ml2/revit, main at clone time)
+
+1. What is trained
+
+imagenet_train_revit.py trains Rot2DTransformerV2 from
+revit_windowed_gcsa.py, not the global Rot2DTransformer in revit_gcsa.py.
+The ImageNet variant has a convolutional stem, four stages of local-window
+attention plus equivariant convolutional MLPs, three strided downsamplers,
+and a group-invariant classification head. There are no learned positional
+embeddings, class tokens, shifted windows, or relative-position biases.
+
+The default stem is two odd-kernel stride-2 ESCNN R2Conv layers (5x5, 3x3).
+Each is followed by InnerBatchNorm and ReLU. Downsamplers use 3x3 stride-2
+R2Conv, InnerBatchNorm and ReLU. At 224 pixels with stem_downsample=4, stage
+maps are 56x56, 28x28, 14x14 and 7x7. Attention projects Q, K and V using
+three separate learned constrained kernels, performs ordinary spatial dot
+product attention independently inside each square window/head, then uses
+a constrained 1x1 output projection. The MLP expands regular fields by
+mlp_ratio using 1x1 R2Conv, field-shared BN, ReLU and a second 1x1 R2Conv.
+Blocks have pre-BN, scalar residual gains and per-sample stochastic depth.
+
+GroupPooling is a maximum over the regular fiber, followed by spatial
+mean, Linear, BatchNorm1d, ReLU, dropout and the final Linear. Group-pooling
+and spatial averaging cannot repair a lack of equivariance upstream.
+
+ImageNet model presets (regular fields, NOT expanded channels):
+  tiny:  dims=12,24,48,96;   depths=1,2,3,1; heads=1,2,4,8
+  small: dims=24,48,96,192;  depths=1,2,4,1; heads=1,2,4,8
+  base:  dims=32,64,128,256; depths=2,2,4,2; heads=1,2,4,8
+  large: dims=64,128,192,384; depths=2,2,6,2; heads=2,4,8,16
+
+The original scripts/benchmark_sdpa.py had a different "base" preset:
+64,128,256,512 with depths 2,2,6,2. Its base result was therefore not a
+measurement of the ImageNet trainer's base. Both now use model_config.py.
+The model class's own constructor defaults also differ from the trainer's
+tiny default; always specify or record the actual configuration.
+
+The original ImageNet REViT CLI defaults are 300 total epochs, 20 warmup
+epochs, batch size 256 PER GPU, AdamW lr=1e-3, weight decay=0.05, gradient
+clip=1, label smoothing=0.1, group C4, tiny, windows=7, MLP ratio=4, QKV
+kernel=1, dropout/attention dropout=0 and stochastic-depth endpoint=0.1.
+The README's small D4 example uses lr=3e-4, QKV kernel=3 and drop path=0.2;
+it is a different recipe. These defaults/examples were not interchangeable.
+
+Training uses ImageFolder train/val directories, RandomResizedCrop,
+RandAugment (2 operations, magnitude 9), ColorJitter, ImageNet normalization,
+RandomErasing p=0.25, and per-batch Mixup alpha=0.8 / CutMix alpha=1.0 with
+equal choice probability and application probability=1. Mixed targets also
+receive label smoothing. There is no explicit horizontal flip; the comment
+claims redundancy for reflection groups, although default C4 has no
+reflections. The revisions retain this augmentation behavior. Validation
+resizes the short side to 256 at image_size=224 and center-crops to 224.
+Training is FP16 AMP on CUDA with GradScaler, and FP32 on CPU. Scheduler
+warmup starts at 0.03*lr, then uses cosine decay, stepping once per epoch.
+
+imagenet_train_vit.py trains a torchvision ViT-Small/16: width 384, depth
+12, six heads and MLP width 1536. This is a conventional baseline with
+absolute position embeddings; it has no REViT equivariance guarantee.
+Its original augmentations are different (including random horizontal
+flip and continuous random rotation), its lr default is 3e-4, its batch
+default is 128, and validation batches are twice the training batch size.
+Those differences remain. Comparing accuracy requires controlling recipes.
+
+revit_gcsa.py is the small-dataset global-attention model. train_revit.py
+trains that model on rotated MNIST, CIFAR-10 or PCam. It is useful for
+understanding attention scaling but is not the ImageNet architecture.
+
+2. Definitions and FLOP accounting
+
+Let g=|G|, d_i=number of regular fields, C_i=g*d_i expanded scalar channels,
+S_i=H_i*W_i, h_i=heads, w=window side, k=QKV kernel side, r=MLP ratio and
+l_i=stage depth. Head dimensions are C_i/h_i, with d_i divisible by h_i so
+that no regular field is cut between heads. The stem's output sides are
+ceil(R/s), followed by repeated ceil(side/2), for input side R and stem
+downsample s. Window partitioning rounds each side up to a multiple of w;
+write S_pad for that padded area.
+
+One multiply-add counts as TWO FLOPs in all supplied numbers. Counts are
+per image, forward only. They include expanded dense convolution, linear
+layers and the two attention matrix products. They exclude ESCNN basis
+expansion, BN, nonlinearities, dropout, softmax, pooling, memory movement,
+optimizer updates, data loading and backward. These are not CUDA latency
+measurements. Compare published MAC counts only after adjusting convention.
+
+For a convolution at output area S_out:
+  FLOPs = 2*S_out*C_in*C_out*k^2.
+Its learned ESCNN coefficients are not C_in*C_out*k^2. A kernel from d_in
+regular fields to d_out regular fields has
+  P_conv = d_in*d_out*b_k(G),
+where b_k is the sampled steerable basis dimension for one regular-field
+pair. For ESCNN 1.0.11's defaults in these models, measured dimensions are
+b_1=g, b_3=6g and b_5=11g for all groups in group_space.py. A single trivial
+input to regular output has 11 coefficients for a 5x5 lifting kernel,
+independent of g in this configuration. These are basis-dependent values,
+not a universal formula for arbitrary ESCNN cutoffs/rings/kernels. See
+kernel_basis_dimensions.json and the --basis-output profiling option.
+
+One transformer block has:
+  Q/K/V + output projection FLOPs: 2*S_i*C_i^2*(3*k^2+1)
+  MLP convolution FLOPs:           4*r*S_i*C_i^2
+  Attention matrix-product FLOPs:  4*S_pad*w^2*C_i
+  Convolution coefficients:       [3*b_k + (1+2*r)*g]*d_i^2
+  BN affine parameters:           (6+2*r)*d_i
+  Residual scalar parameters:     2
+
+Multiply block terms by stage depth l_i. A transition adds
+2*S_next*C_i*C_next*9 dense FLOPs, 6*g*d_i*d_next coefficients and
+2*d_next BN affine parameters. The default two-layer stem adds
+33*m + 6*g*m*d_0 coefficients and 2*m+2*d_0 BN affine parameters, with
+m=max(1,floor(d_0/2)). The classifier hidden width is
+u=max(256,floor(d_last/2)); its parameter count is
+u*(d_last+num_classes+3)+num_classes, including BN affine terms.
+Count actual model.parameters(), never all state_dict tensors: expanded
+filters and sampled basis buffers are not additional learned parameters.
+
+At fixed regular-field counts, doubling group order approximately doubles
+learned convolution coefficients, QUADRUPLES dense convolution FLOPs and
+expanded filter storage, and doubles activation channels and attention
+matrix-product FLOPs. The group-independent classifier prevents total
+parameter ratios from being exactly two. At fixed expanded channels, one
+would instead reduce d proportionally to 1/g: dense arithmetic stays
+roughly fixed and constrained convolution coefficients fall roughly as
+1/g. That also changes field capacity, classifier width and the symmetry
+group; it is an architecture ablation, not a free accuracy-neutral change.
+
+Group labels in this repository have important special cases:
+  "Z2" -> trivialOnR2(), order 1 (despite the label).
+  "D2" -> flip2dOnR2(), order 2 (one reflection, not mathematical D2).
+  C4/C8/C12/C16 have orders 4/8/12/16.
+  D4/D8/D12/D16 have orders 8/16/24/32.
+Use gspace.fibergroup.order(), not the numeric suffix alone.
+
+3. Measured parameters and estimated compute
+
+All results below use ImageNet presets, r=4, stem=4, w=7, 1000 classes and
+224x224 input. Parameters are exact model.parameters() counts using ESCNN
+1.0.11; GFLOPs follow the convention above. Fusion does not change either
+column. Full machine-readable stage breakdowns are in scaling_results.json.
+
+model  group   k    parameters     GFLOPs/image
+tiny   C4      1     1,270,360           1.605
+tiny   C4      3     2,315,800           4.032
+tiny   D4      1     2,253,592           6.156
+tiny   D4      3     4,344,472          15.867
+small  C4      1     4,693,116           6.865
+small  C4      3     9,427,836          17.963
+small  D4      1     9,068,412          26.908
+small  D4      3    18,537,852          71.301
+base   C4      1    11,315,052          14.636
+base   C4      3    23,725,932          39.299
+base   D4      1    22,288,236          57.634
+base   D4      3    47,109,996         156.284
+large  C4      1    29,734,752          48.973
+large  C4      3    63,158,112         132.826
+large  D4      1    59,078,496         194.053
+large  D4      3   125,925,216         529.463
+
+Tiny group sweep (k=1 / k=3, same remaining settings):
+  trivial "Z2", g=1: 0.533M / 0.794M parameters; 0.125 / 0.277 GFLOPs
+  reflection "D2",g=2: 0.779M / 1.301M;          0.434 / 1.041 GFLOPs
+  C4, g=4:              1.270M / 2.316M;          1.605 / 4.032 GFLOPs
+  C8 or D4, g=8:        2.254M / 4.344M;          6.156 /15.867 GFLOPs
+  D8, g=16:             4.220M / 8.402M;         24.104 /62.947 GFLOPs
+Equal order does not mean equal spatial symmetry or equal equivariance
+on a square pixel grid. See the geometric limitations below.
+
+Resolution: REViT has no resolution-dependent learned parameters. Doubling
+224 to 448 multiplies spatial convolution and fixed-window attention work
+by four, with the tiny fixed classifier FLOPs unchanged. For example,
+small D4 k=3 changes from 71.301 to 285.201 GFLOPs, with 18,537,852
+parameters in both cases. Padding makes other resolution ratios uneven.
+At 320 with the same configuration, the count is 145.614 GFLOPs and stage
+sides are 80,40,20,10; these do not align with w=7.
+
+Global attention is different: at spatial token count S it costs
+4*S^2*C, so doubling image side makes its attention matmuls 16x larger.
+Its explicit score memory is O(batch*heads*S^2). This is why the global
+model cannot be extrapolated cheaply to ImageNet resolution. Windowed
+scores require O(batch*heads*S_pad*w^2); fused SDPA may avoid materializing
+the full score tensor, but does not change the arithmetic scaling law.
+
+Increasing w does not change learned parameters. Ignoring padding, it
+increases attention FLOPs and score storage proportional to w^2. It does
+not change the much larger dense projection/MLP terms. For small D4 k=3,
+attention matmuls are below 1% of total counted work. Stage 3 alone costs
+34.453 of 71.301 GFLOPs (about 48%): its four blocks matter more than its
+smaller spatial map suggests. When widths double as area quarters, dense
+per-block convolution work stays about constant across stages. Late-stage
+weights dominate parameter storage; early-stage maps dominate activations.
+
+Increasing heads at fixed fields/channels changes neither projection
+parameters nor leading attention matmul FLOPs. It increases score/softmax
+storage proportional to head count and reduces each head's channel width.
+It can change representation capacity and fused-kernel eligibility. All
+heads must contain complete regular fields; raw arbitrary channel splits
+would invalidate the equivariance argument.
+
+Changing k=1 to k=3 multiplies each dense QKV convolution's work by nine.
+With r=4, total block convolution FLOPs rise from 24*S*C^2 to 72*S*C^2
+(3x), whereas block convolution coefficient counts rise from 12*g*d^2 to
+27*g*d^2 (2.25x). This discrepancy explains seemingly small models with
+very expensive training. Removing spatial QKV kernels may change accuracy
+and cross-window feature mixing, so the revisions do not silently do it.
+
+Depth scales each stage's block parameters and compute linearly. Scaling
+all widths by a multiplies dominant coefficients and convolutions by a^2,
+but activations and attention products by a. Changing r scales the two
+MLP convolution terms linearly. Changing batch size scales activation and
+arithmetic costs linearly; DDP gradients communicate learned coefficients,
+while expanded filters/attention are still computed independently per GPU.
+
+The stem-downsample knob illustrates a non-neutral speed tradeoff. At
+224, small D4 k=3 uses about 280.678 / 71.301 / 19.209 GFLOPs for stem
+downsamples 2 / 4 / 8 respectively. The stem architecture and information
+retention change, and stem=8 gives final side 4, incompatible with w=7.
+These settings are exposed for controlled experiments, not set as new
+defaults. See geometry_scaling_results.json.
+
+ViT-Small/16 has 197 tokens at 224 and 785 at 448, including its class
+token. Exact torchvision parameter counts are 22,050,664 and 22,276,456;
+the difference is its learned position embedding. Dense forward estimates
+are 9.198 and 45.158 GFLOPs. Per block they are
+2*T*C^2*(4+2*r)+4*T^2*C. This includes global attention, so resolution
+growth eventually becomes quartic in side length. Unlike REViT, its
+parameter count also increases with image resolution.
+
+4. Equivariance: what the optimization preserves, and existing limitations
+
+Regular representations of these finite groups are orthogonal permutation
+matrices. For a complete-field head, rotating/reflection-transforming Q
+and K applies the same orthogonal fiber matrix, so their channel inner
+product is unchanged apart from spatial index permutation. Row softmax
+and attention-weighted V commute with that permutation when the window
+partition itself transforms to a permutation of windows. Output R2Conv,
+field-shared BN, pointwise ReLU and residual scalars preserve the feature
+transformation law under the same assumptions.
+
+Stacking the three original constrained kernels into one convolution is
+their direct sum. It introduces no free dense parameters, no mixing of
+group components between heads, no changed attention normalization and
+no changed neighborhood. Packing the three projected maps into one window
+partition is a reshape/permutation of the same values. The optimized
+function therefore has the same equivariance error as the original,
+subject to floating-point rounding. SDPA is the same mathematical softmax
+attention, with backend-dependent rounding and dropout random draws.
+
+The original full model is NOT exactly equivariant to arbitrary spatial
+rotations at arbitrary resolution. The report explicitly distinguishes
+this from preserving the original function:
+
+  a) Square windows tiled without remainder are compatible with square-grid
+     C4/D4 rotations/reflections. Bottom/right-only padding when sizes are
+     not multiples of w breaks that partition symmetry. Padding positions
+     also participate as zero K/V tokens without a mask, changing boundary
+     softmax normalization. The implementation keeps these legacy outputs
+     for compatibility and the trainer now warns about unaligned geometry.
+     Simply adding a mask would change outputs and would not repair the
+     asymmetric partition's full geometric problem.
+
+  b) On an even-sized image, an odd-kernel stride-2 convolution samples a
+     grid phase that a centered 90-degree rotation/reflection maps to the
+     opposite parity. This is a real discrete sampling problem, even with
+     a perfectly constrained continuous kernel. The default stem and the
+     downsamplers already have it. It cannot be fixed by merely fusing
+     convolutions or changing attention implementation. Center-aligned
+     filtering/pooling or multi-phase designs would require retraining
+     and separate accuracy/compute evaluation. They are not silently added.
+
+  c) C8/C12/C16 and their reflection extensions contain rotations not
+     preserving the square pixel lattice. Interpolation creates additional
+     discretization error, and square window partitions are not preserved
+     by these non-right-angle rotations even in continuous space. A larger
+     nominal ESCNN group alone does not make window attention equivariant
+     to its full group. C4/D4 are the appropriate exact-grid attention
+     audits; end-to-end sampling limits still apply to them.
+
+  d) Attention dropout and PointwiseDropout use independent random masks.
+     They are equivariant in distribution for these permutation actions,
+     not deterministically for arbitrary independently sampled masks.
+     Deterministic equivariance checks must disable stochastic layers or
+     transform/couple masks appropriately. DropPath's per-example scalar
+     mask commutes with the group when the same mask is used. Checkpoint
+     RNG preservation is retained, and tested with dropout enabled.
+
+In the original-versus-revised tiny D4 k=3 CPU experiment, the full-model
+90-degree rotation logit discrepancy was 8.434765e-4 for both bmm variants
+on the same random weights/input. Thus full invariance was already
+imperfect, while this revision did not worsen it. These small random
+logits are not a robustness or accuracy benchmark. Layer-level C4/D4 tests
+cover all group elements, k=1 and 3, both attention implementations and
+aligned windows. Do not reinterpret those tests as a proof that the whole
+original architecture has exact ImageNet invariance.
+
+5. Suggested improvements and their status
+
+Applied: combine QKV convolution execution with original coefficients;
+partition packed QKV windows once; remove redundant max-subtraction before
+stable softmax; retain selectable bmm/SDPA; initialize V2 convolutions once;
+discard unused initial expanded-filter buffers; avoid per-batch metric
+synchronizations; reduce DDP buffer traffic; evaluate each validation
+example exactly once without forward collectives; canonicalize and shrink
+checkpoints; restore scaler/RNG/optimizer/scheduler; fix resumed epoch
+limits; support zero warmup; honor image size in both trainers; share model
+presets; add numerical/equivariance/distributed regression checks and
+reproducible profiling/benchmarking. See OPTIMIZATION_REPORT.txt for details.
+
+Available as opt-in experiments: SDPA, CUDA fused AdamW and BF16 AMP. Their
+best settings depend on the target GPU, head dimensions and precision.
+Existing bmm/FP16 defaults are retained, and --no-fused-qkv is available.
+
+Not applied as supposedly accuracy-neutral optimizations: fewer fields,
+smaller groups, shallower stages, lower resolution, larger initial stride,
+smaller QKV kernels, changing MLP expansion, altered regularization,
+normalization replacement, rank-reduced/separable kernels, reordered
+max/mean pooling, or gradient accumulation pretending to preserve BN
+statistics. These may be useful ablations, but change the learned function
+or training recipe and require full ImageNet comparisons. Exact geometric
+repairs to sampling/windows also belong in a separately validated design.
+
+Primary technical references checked alongside installed source:
+  ESCNN R2Conv constrained weights, expansion, initialization and eval cache:
+  https://quva-lab.github.io/escnn/_modules/escnn/nn/modules/conv/r2convolution.html
+  https://quva-lab.github.io/escnn/api/escnn.nn.html
+  PyTorch SDPA semantics and backend-dependent numerics:
+  https://docs.pytorch.org/docs/stable/generated/torch.nn.functional.scaled_dot_product_attention.html
+  PyTorch non-reentrant checkpoint recomputation contexts:
+  https://docs.pytorch.org/docs/stable/checkpoint.html
+
+The code, exact coefficient counts and local measurements are the primary
+evidence for this repository-specific report. No ImageNet dataset or CUDA
+training node was available; no ImageNet accuracy or CUDA speedup is claimed.

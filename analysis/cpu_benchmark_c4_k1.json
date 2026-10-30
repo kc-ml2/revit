@@ -1,0 +1,156 @@
+{
+  "args": {
+    "baseline_ref": "2558962",
+    "model_size": "tiny",
+    "group": "C4",
+    "image_size": 224,
+    "window_size": 7,
+    "qkv_kernel_size": 1,
+    "batch_size": 2,
+    "device": "cpu",
+    "dtype": "float32",
+    "threads": 1,
+    "warmup": 3,
+    "iterations": 10,
+    "fast_init": false,
+    "output": "analysis/cpu_benchmark_c4_k1.json"
+  },
+  "environment": {
+    "torch": "2.9.1",
+    "platform": "macOS-26.5.2-arm64-arm-64bit",
+    "device": "arm"
+  },
+  "construction_seconds": {
+    "baseline": 6.306928125210106,
+    "optimized": 5.312656833790243
+  },
+  "baseline_rotation90_logit_error": 0.0012833746150135994,
+  "checks": [
+    {
+      "variant": "baseline_bmm_separate_qkv",
+      "fp32_max_abs_logit_difference": 0.0,
+      "rotation90_max_abs_logit_difference": 0.0012833746150135994
+    },
+    {
+      "variant": "optimized_bmm_fused_qkv",
+      "fp32_max_abs_logit_difference": 0.0,
+      "rotation90_max_abs_logit_difference": 0.0012833746150135994
+    },
+    {
+      "variant": "optimized_sdpa_fused_qkv",
+      "fp32_max_abs_logit_difference": 5.587935447692871e-09,
+      "rotation90_max_abs_logit_difference": 0.0012833746150135994
+    }
+  ],
+  "rows": [
+    {
+      "variant": "baseline_bmm_separate_qkv",
+      "training": false,
+      "median_ms": 20.403458271175623,
+      "samples_ms": [
+        20.193375647068024,
+        20.27716673910618,
+        20.34949976950884,
+        20.54616715759039,
+        20.356041379272938,
+        19.937542267143726,
+        20.486834459006786,
+        20.67625056952238,
+        20.450875163078308,
+        20.48791665583849
+      ],
+      "peak_allocated_bytes": null
+    },
+    {
+      "variant": "baseline_bmm_separate_qkv",
+      "training": true,
+      "median_ms": 60.60433341190219,
+      "samples_ms": [
+        59.37475059181452,
+        59.72204077988863,
+        70.17708383500576,
+        59.49920881539583,
+        60.88958401232958,
+        60.41812524199486,
+        61.350082978606224,
+        59.54233277589083,
+        60.79054158180952,
+        65.4083751142025
+      ],
+      "peak_allocated_bytes": null
+    },
+    {
+      "variant": "optimized_bmm_fused_qkv",
+      "training": false,
+      "median_ms": 20.75366722419858,
+      "samples_ms": [
+        20.287041552364826,
+        20.434875041246414,
+        20.517542026937008,
+        20.757666788995266,
+        21.360124461352825,
+        21.19208313524723,
+        31.361250206828117,
+        20.79279161989689,
+        20.48387471586466,
+        20.749667659401894
+      ],
+      "peak_allocated_bytes": null
+    },
+    {
+      "variant": "optimized_bmm_fused_qkv",
+      "training": true,
+      "median_ms": 59.0226873755455,
+      "samples_ms": [
+        58.947375044226646,
+        58.511167764663696,
+        59.90216601639986,
+        59.23520866781473,
+        59.17733255773783,
+        59.351458214223385,
+        58.14237520098686,
+        59.09799970686436,
+        58.66558291018009,
+        58.62024985253811
+      ],
+      "peak_allocated_bytes": null
+    },
+    {
+      "variant": "optimized_sdpa_fused_qkv",
+      "training": false,
+      "median_ms": 21.22895885258913,
+      "samples_ms": [
+        21.542624570429325,
+        21.679749712347984,
+        21.117834374308586,
+        21.62591740489006,
+        21.099583245813847,
+        21.340083330869675,
+        20.97287494689226,
+        20.746957510709763,
+        20.801625214517117,
+        21.77854161709547
+      ],
+      "peak_allocated_bytes": null
+    },
+    {
+      "variant": "optimized_sdpa_fused_qkv",
+      "training": true,
+      "median_ms": 62.69285315647721,
+      "samples_ms": [
+        62.60137539356947,
+        62.693165615200996,
+        62.35575024038553,
+        62.09091655910015,
+        63.19024972617626,
+        62.82916571944952,
+        62.92770802974701,
+        62.69254069775343,
+        62.62724939733744,
+        62.92024999856949
+      ],
+      "peak_allocated_bytes": null
+    }
+  ],
+  "notes": "Synthetic batches; training = forward+backward without optimizer/data loader. CPU results do not predict CUDA speed."
+}

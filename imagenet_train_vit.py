@@ -1,21 +1,23 @@
 import argparse
-import copy
 import os
 import random
 from datetime import datetime
+from imagenet_utils import (
+    DistributedEvalSampler, build_scheduler, evaluate,
+    save_training_checkpoint, setup_distributed,
+    train_one_epoch,
+)
 
 import numpy as np
 import torch
 import torch.distributed as dist
 import torch.nn as nn
 from torch.nn.parallel import DistributedDataParallel as DDP
-from torch.optim.lr_scheduler import CosineAnnealingLR, LinearLR, SequentialLR
 from torch.utils.data import DataLoader
 from torch.utils.data.distributed import DistributedSampler
 from torch.utils.tensorboard import SummaryWriter
 from torchvision import datasets, transforms
 from torchvision.models.vision_transformer import VisionTransformer
-from tqdm import tqdm
 
 
 def count_parameters(model: nn.Module):
@@ -33,17 +35,6 @@ def seed_everything(seed: int = 42):
     torch.cuda.manual_seed_all(seed)
 
 
-def setup_distributed():
-    if "RANK" not in os.environ or "WORLD_SIZE" not in os.environ:
-        return None, None, None
-    rank = int(os.environ["RANK"])
-    world_size = int(os.environ["WORLD_SIZE"])
-    local_rank = int(os.environ.get("LOCAL_RANK", 0))
-    dist.init_process_group(backend="nccl", init_method="env://")
-    torch.cuda.set_device(local_rank)
-    return rank, world_size, local_rank
-
-
 def cleanup_distributed():
     if dist.is_initialized():
         dist.destroy_process_group()
@@ -53,14 +44,14 @@ def is_main_process(rank):
     return rank is None or rank == 0
 
 
-def get_imagenet_loaders(data_root, batch_size=256, num_workers=8, use_ddp=False):
+def get_imagenet_loaders(data_root, batch_size=256, num_workers=8, use_ddp=False, image_size=224):
     train_dir = os.path.join(data_root, "train")
     val_dir = os.path.join(data_root, "val")
 
     normalize = transforms.Normalize(mean=(0.485, 0.456, 0.406), std=(0.229, 0.224, 0.225))
     train_tfms = transforms.Compose(
         [
-            transforms.RandomResizedCrop(224, scale=(0.08, 1.0)),
+            transforms.RandomResizedCrop(image_size, scale=(0.08, 1.0)),
             transforms.RandomHorizontalFlip(),
             transforms.RandomRotation(degrees=90),
             transforms.ColorJitter(0.4, 0.4, 0.4, 0.1),
@@ -70,8 +61,8 @@ def get_imagenet_loaders(data_root, batch_size=256, num_workers=8, use_ddp=False
     )
     val_tfms = transforms.Compose(
         [
-            transforms.Resize(256),
-            transforms.CenterCrop(224),
+            transforms.Resize(round(image_size * 256 / 224)),
+            transforms.CenterCrop(image_size),
             transforms.ToTensor(),
             normalize,
         ]
@@ -81,7 +72,7 @@ def get_imagenet_loaders(data_root, batch_size=256, num_workers=8, use_ddp=False
     val_ds = datasets.ImageFolder(val_dir, transform=val_tfms)
 
     train_sampler = DistributedSampler(train_ds, shuffle=True) if use_ddp else None
-    val_sampler = DistributedSampler(val_ds, shuffle=False) if use_ddp else None
+    val_sampler = DistributedEvalSampler(val_ds) if use_ddp else None
 
     train_loader = DataLoader(
         train_ds,
@@ -102,83 +93,6 @@ def get_imagenet_loaders(data_root, batch_size=256, num_workers=8, use_ddp=False
         persistent_workers=num_workers > 0,
     )
     return train_loader, val_loader, train_sampler
-
-
-def train_one_epoch(model, loader, optimizer, scaler, device, epoch, rank, grad_clip=1.0, label_smoothing=0.1):
-    model.train()
-    criterion = nn.CrossEntropyLoss(label_smoothing=label_smoothing)
-    total_loss = 0.0
-    steps = 0
-
-    pbar = tqdm(loader, unit="batch", disable=not is_main_process(rank))
-    for x, y in pbar:
-        x = x.to(device, non_blocking=True)
-        y = y.to(device, non_blocking=True)
-
-        optimizer.zero_grad(set_to_none=True)
-        with torch.autocast(
-            device_type="cuda" if device.type == "cuda" else "cpu",
-            dtype=torch.float16,
-            enabled=device.type == "cuda",
-        ):
-            out = model(x)
-            loss = criterion(out, y)
-
-        scaler.scale(loss).backward()
-        scaler.unscale_(optimizer)
-        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=grad_clip)
-        scaler.step(optimizer)
-        scaler.update()
-
-        total_loss += loss.item()
-        steps += 1
-        pbar.set_description(f"Epoch {epoch}")
-        pbar.set_postfix(loss=loss.item())
-
-    avg_loss = total_loss / max(steps, 1)
-    if rank is not None and dist.is_initialized():
-        t = torch.tensor([avg_loss], device=device, dtype=torch.float64)
-        dist.all_reduce(t, op=dist.ReduceOp.SUM)
-        avg_loss = (t / dist.get_world_size()).item()
-    return avg_loss
-
-
-@torch.no_grad()
-def evaluate(model, loader, device, rank):
-    model.eval()
-    criterion = nn.CrossEntropyLoss()
-    total_loss = 0.0
-    top1 = 0
-    top5 = 0
-    total = 0
-
-    for x, y in loader:
-        x = x.to(device, non_blocking=True)
-        y = y.to(device, non_blocking=True)
-
-        with torch.autocast(
-            device_type="cuda" if device.type == "cuda" else "cpu",
-            dtype=torch.float16,
-            enabled=device.type == "cuda",
-        ):
-            out = model(x)
-            loss = criterion(out, y)
-
-        bs = y.size(0)
-        total_loss += loss.item() * bs
-        total += bs
-
-        _, pred = out.topk(5, dim=1, largest=True, sorted=True)
-        correct = pred.eq(y.view(-1, 1))
-        top1 += correct[:, :1].sum().item()
-        top5 += correct.sum().item()
-
-    if rank is not None and dist.is_initialized():
-        t = torch.tensor([total_loss, float(total), float(top1), float(top5)], device=device, dtype=torch.float64)
-        dist.all_reduce(t, op=dist.ReduceOp.SUM)
-        total_loss, total, top1, top5 = t.tolist()
-
-    return total_loss / total, top1 / total, top5 / total
 
 
 def build_vit_small(num_classes=1000, image_size=224, patch_size=16, dropout=0.0, attention_dropout=0.0):
@@ -204,6 +118,10 @@ def main():
     parser.add_argument("--warmup-epochs", type=int, default=20)
     parser.add_argument("--batch-size", type=int, default=128, help="Per-GPU batch size in DDP mode")
     parser.add_argument("--num-workers", type=int, default=8)
+    parser.add_argument("--amp-dtype", choices=["float16", "bfloat16"], default="float16")
+    parser.add_argument("--fused-adamw", action=argparse.BooleanOptionalAction, default=False)
+    parser.add_argument("--log-interval", type=int, default=50, help="Batch interval for device-to-host loss logging; 0 disables")
+    parser.add_argument("--checkpoint-interval", type=int, default=10, help="Save last.pt every N epochs (0: best only), plus final epoch when N > 0")
 
     parser.add_argument("--lr", type=float, default=3e-4)
     parser.add_argument("--weight-decay", type=float, default=0.05)
@@ -220,9 +138,13 @@ def main():
     parser.add_argument("--data-parallel", action="store_true", help="Use DataParallel when not using DDP")
 
     args = parser.parse_args()
-    seed_everything(args.seed)
+    if args.image_size <= 0 or args.batch_size <= 0 or args.num_workers < 0:
+        parser.error("image size/batch size must be positive and num-workers nonnegative")
+    if not 0 <= args.warmup_epochs < args.epochs:
+        parser.error("Require 0 <= --warmup-epochs < --epochs")
 
-    rank, _, local_rank = setup_distributed()
+    rank, _, local_rank = setup_distributed(args.ddp)
+    seed_everything(args.seed + (rank or 0))
     use_ddp = args.ddp and rank is not None
 
     if use_ddp:
@@ -237,6 +159,7 @@ def main():
         batch_size=args.batch_size,
         num_workers=args.num_workers,
         use_ddp=use_ddp,
+        image_size=args.image_size,
     )
 
     model = build_vit_small(
@@ -248,7 +171,7 @@ def main():
     ).to(device)
 
     if use_ddp:
-        model = DDP(model, device_ids=[local_rank], output_device=local_rank)
+        model = DDP(model, device_ids=[local_rank], output_device=local_rank, broadcast_buffers=False)
     elif args.data_parallel and torch.cuda.device_count() > 1:
         model = nn.DataParallel(model)
 
@@ -261,15 +184,19 @@ def main():
     else:
         writer = None
 
-    optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
-    warmup_scheduler = LinearLR(optimizer, start_factor=0.03, total_iters=args.warmup_epochs)
-    cosine_scheduler = CosineAnnealingLR(optimizer, T_max=args.epochs - args.warmup_epochs)
-    scheduler = SequentialLR(optimizer, schedulers=[warmup_scheduler, cosine_scheduler], milestones=[args.warmup_epochs])
-    scaler = torch.amp.GradScaler("cuda" if device.type == "cuda" else "cpu", enabled=device.type == "cuda")
+    optimizer = torch.optim.AdamW(
+        model.parameters(), lr=args.lr, weight_decay=args.weight_decay,
+        fused=args.fused_adamw and device.type == "cuda",
+    )
+    scheduler = build_scheduler(optimizer, args.epochs, args.warmup_epochs)
+    amp_dtype = {"float16": torch.float16, "bfloat16": torch.bfloat16}[args.amp_dtype]
+    if device.type == "cuda" and amp_dtype == torch.bfloat16 and not torch.cuda.is_bf16_supported():
+        parser.error("This CUDA device does not support bfloat16")
+    scaler = torch.amp.GradScaler("cuda", enabled=device.type == "cuda" and amp_dtype == torch.float16)
 
-    best_top1 = 0.0
+    best_top1 = float("-inf")
     best_epoch = -1
-    best_state = None
+    best_ckpt_path = None
 
     for epoch in range(args.epochs):
         if train_sampler is not None:
@@ -288,10 +215,12 @@ def main():
             rank if use_ddp else None,
             grad_clip=args.grad_clip,
             label_smoothing=args.label_smoothing,
+            amp_dtype=amp_dtype,
+            log_interval=args.log_interval,
         )
         scheduler.step()
 
-        val_loss, top1, top5 = evaluate(model, val_loader, device, rank if use_ddp else None)
+        val_loss, top1, top5 = evaluate(model, val_loader, device, rank if use_ddp else None, amp_dtype=amp_dtype)
 
         if is_main_process(rank):
             writer.add_scalar("train/loss", train_loss, epoch)
@@ -302,26 +231,26 @@ def main():
                 f"Epoch {epoch:03d} | train_loss={train_loss:.4f} | val_loss={val_loss:.4f} | top1={top1:.4f} | top5={top5:.4f}"
             )
 
-            if top1 > best_top1:
-                best_top1 = top1
-                best_epoch = epoch
-                best_state = copy.deepcopy(model.state_dict())
-                torch.save(
-                    {
-                        "epoch": best_epoch,
-                        "model_state_dict": model.state_dict(),
-                        "optimizer_state_dict": optimizer.state_dict(),
-                        "scheduler_state_dict": scheduler.state_dict(),
-                        "top1": best_top1,
-                    },
-                    os.path.join(args.output_dir, "checkpoints", f"imagenet_vit_small_best_epoch_{best_epoch}.pt"),
-                )
+        if top1 > best_top1:
+            best_top1, best_epoch = top1, epoch
+            best_ckpt_path = os.path.join(args.output_dir, "checkpoints", "best.pt")
+            save_training_checkpoint(
+                best_ckpt_path, model, optimizer, scheduler, epoch, top1, device,
+                scaler=scaler, args=args, best_top1=best_top1, best_epoch=best_epoch,
+            )
+        if args.checkpoint_interval > 0 and ((epoch + 1) % args.checkpoint_interval == 0 or epoch + 1 == args.epochs):
+            save_training_checkpoint(
+                os.path.join(args.output_dir, "checkpoints", "last.pt"),
+                model, optimizer, scheduler, epoch, top1, device,
+                scaler=scaler, args=args, best_top1=best_top1, best_epoch=best_epoch,
+            )
 
     if is_main_process(rank):
         writer.close()
-        if best_state is not None:
+        if best_ckpt_path is not None:
+            ckpt = torch.load(best_ckpt_path, map_location="cpu", weights_only=False)
             torch.save(
-                best_state,
+                ckpt["model_state_dict"],
                 os.path.join(args.output_dir, f"imagenet_vit_small_best_top1_{best_top1:.4f}_epoch_{best_epoch}.pth"),
             )
             print(f"Best top1={best_top1:.4f} at epoch={best_epoch}")

@@ -1,21 +1,26 @@
 import argparse
 import os
 import random
+import warnings
 from datetime import datetime
+from imagenet_utils import (
+    DistributedEvalSampler, build_scheduler, evaluate, load_model_state,
+    restore_training_state, save_training_checkpoint, setup_distributed,
+    train_one_epoch,
+)
 import numpy as np
 import torch
 import torch.distributed as dist
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.nn.parallel import DistributedDataParallel as DDP
-from torch.optim.lr_scheduler import CosineAnnealingLR, LinearLR, SequentialLR
 from torch.utils.data import DataLoader
 from torch.utils.data.distributed import DistributedSampler
 from torch.utils.tensorboard import SummaryWriter
 from torchvision import datasets, transforms
 from torchvision.transforms import v2 as T_v2
-from tqdm import tqdm
 from group_space import get_gspace
+from model_config import MODEL_PRESETS
 
 from revit_windowed_gcsa import Rot2DTransformerV2, count_parameters
 
@@ -61,17 +66,6 @@ def seed_everything(seed: int = 42):
     torch.cuda.manual_seed_all(seed)
 
 
-def setup_distributed():
-    if "RANK" not in os.environ or "WORLD_SIZE" not in os.environ:
-        return None, None, None
-    rank = int(os.environ["RANK"])
-    world_size = int(os.environ["WORLD_SIZE"])
-    local_rank = int(os.environ.get("LOCAL_RANK", 0))
-    dist.init_process_group(backend="nccl", init_method="env://")
-    torch.cuda.set_device(local_rank)
-    return rank, world_size, local_rank
-
-
 def cleanup_distributed():
     if dist.is_initialized():
         dist.destroy_process_group()
@@ -81,49 +75,11 @@ def is_main_process(rank):
     return rank is None or rank == 0
 
 
-def _strip_module_prefix(state_dict):
-    if not state_dict:
-        return state_dict
-    k0 = next(iter(state_dict.keys()))
-    if k0.startswith("module."):
-        return {key[len("module.") :]: value for key, value in state_dict.items()}
-    return state_dict
-
-
-def _to_cpu(obj):
-    if torch.is_tensor(obj):
-        return obj.detach().cpu()
-    if isinstance(obj, dict):
-        return {k: _to_cpu(v) for k, v in obj.items()}
-    if isinstance(obj, list):
-        return [_to_cpu(v) for v in obj]
-    if isinstance(obj, tuple):
-        return tuple(_to_cpu(v) for v in obj)
-    return obj
-
-
-def save_training_checkpoint(path, model, optimizer, scheduler, epoch, top1, device):
-    """Write checkpoint from CPU tensors so rank 0 does not spike GPU memory."""
-    if device.type == "cuda":
-        torch.cuda.synchronize()
-    payload = {
-        "epoch": epoch,
-        "top1": top1,
-        "model_state_dict": _to_cpu(model.state_dict()),
-        "optimizer_state_dict": _to_cpu(optimizer.state_dict()),
-        "scheduler_state_dict": _to_cpu(scheduler.state_dict()),
-    }
-    torch.save(payload, path)
-    del payload
-    if device.type == "cuda":
-        torch.cuda.empty_cache()
-
-
 def load_pretrained_weights(model: nn.Module, path: str, device: torch.device) -> dict:
-    ckpt = torch.load(path, map_location=device, weights_only=False)
+    ckpt = torch.load(path, map_location="cpu", weights_only=False)
     if "model_state_dict" not in ckpt:
         raise KeyError(f"Checkpoint at {path} has no 'model_state_dict' key")
-    model.load_state_dict(_strip_module_prefix(ckpt["model_state_dict"]))
+    load_model_state(model, ckpt["model_state_dict"])
     return ckpt
 
 
@@ -137,13 +93,14 @@ def get_imagenet_loaders(
     randaugment_num_ops=2,
     randaugment_magnitude=9,
     random_erase=0.25,
+    image_size=224,
 ):
     train_dir = os.path.join(data_root, "train")
     val_dir = os.path.join(data_root, "val")
 
     normalize = transforms.Normalize(mean=(0.485, 0.456, 0.406), std=(0.229, 0.224, 0.225))
     train_list = [
-        transforms.RandomResizedCrop(224, scale=(0.08, 1.0)),
+        transforms.RandomResizedCrop(image_size, scale=(0.08, 1.0)),
         # RandomHorizontalFlip omitted: redundant under D4 / reflection groups.
     ]
     if randaugment:
@@ -159,8 +116,8 @@ def get_imagenet_loaders(
 
     val_tfms = transforms.Compose(
         [
-            transforms.Resize(256),
-            transforms.CenterCrop(224),
+            transforms.Resize(round(image_size * 256 / 224)),
+            transforms.CenterCrop(image_size),
             transforms.ToTensor(),
             normalize,
         ]
@@ -170,7 +127,7 @@ def get_imagenet_loaders(
     val_ds = datasets.ImageFolder(val_dir, transform=val_tfms)
 
     train_sampler = DistributedSampler(train_ds, shuffle=True) if use_ddp else None
-    val_sampler = DistributedSampler(val_ds, shuffle=False) if use_ddp else None
+    val_sampler = DistributedEvalSampler(val_ds) if use_ddp else None
 
     train_loader = DataLoader(
         train_ds,
@@ -193,92 +150,6 @@ def get_imagenet_loaders(
     return train_loader, val_loader, train_sampler
 
 
-def train_one_epoch(
-    model,
-    loader,
-    optimizer,
-    scaler,
-    device,
-    epoch,
-    rank,
-    grad_clip=1.0,
-    label_smoothing=0.1,
-    mixup_fn=None,
-    mixup_prob=1.0,
-):
-    model.train()
-    hard_criterion = nn.CrossEntropyLoss(label_smoothing=label_smoothing)
-    soft_criterion = SoftTargetCrossEntropy()
-    total_loss = 0.0
-    steps = 0
-
-    pbar = tqdm(loader, unit="batch", disable=not is_main_process(rank))
-    for x, y in pbar:
-        x = x.to(device, non_blocking=True)
-        y = y.to(device, non_blocking=True)
-        x, y, soft = apply_mixup_cutmix(mixup_fn, x, y, mixup_prob)
-        if soft and label_smoothing > 0.0:
-            # Mild label smoothing on already-mixed soft targets (DeiT-style).
-            y = y * (1.0 - label_smoothing) + label_smoothing / y.size(-1)
-
-        optimizer.zero_grad(set_to_none=True)
-        with torch.autocast(device_type="cuda" if device.type == "cuda" else "cpu", dtype=torch.float16, enabled=device.type == "cuda"):
-            out = model(x)
-            loss = soft_criterion(out, y) if soft else hard_criterion(out, y)
-
-        scaler.scale(loss).backward()
-        scaler.unscale_(optimizer)
-        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=grad_clip)
-        scaler.step(optimizer)
-        scaler.update()
-
-        total_loss += loss.item()
-        steps += 1
-        pbar.set_description(f"Epoch {epoch}")
-        pbar.set_postfix(loss=loss.item())
-
-    avg_loss = total_loss / max(steps, 1)
-    if rank is not None and dist.is_initialized():
-        t = torch.tensor([avg_loss], device=device, dtype=torch.float64)
-        dist.all_reduce(t, op=dist.ReduceOp.SUM)
-        avg_loss = (t / dist.get_world_size()).item()
-    return avg_loss
-
-
-@torch.no_grad()
-def evaluate(model, loader, device, rank):
-    model.eval()
-    criterion = nn.CrossEntropyLoss()
-    total_loss = 0.0
-    top1 = 0
-    top5 = 0
-    total = 0
-
-    for x, y in loader:
-        x = x.to(device, non_blocking=True)
-        y = y.to(device, non_blocking=True)
-
-        with torch.autocast(device_type="cuda" if device.type == "cuda" else "cpu", dtype=torch.float16, enabled=device.type == "cuda"):
-            out = model(x)
-            loss = criterion(out, y)
-
-        bs = y.size(0)
-        total_loss += loss.item() * bs
-        total += bs
-
-        _, pred = out.topk(5, dim=1, largest=True, sorted=True)
-        correct = pred.eq(y.view(-1, 1))
-        top1 += correct[:, :1].sum().item()
-        top5 += correct.sum().item()
-
-    if rank is not None and dist.is_initialized():
-        t = torch.tensor([total_loss, float(total), float(top1), float(top5)], device=device, dtype=torch.float64)
-        dist.all_reduce(t, op=dist.ReduceOp.SUM)
-        total_loss, total, top1, top5 = t.tolist()
-
-    return total_loss / total, top1 / total, top5 / total
-
-
 def main():
     parser = argparse.ArgumentParser("ImageNet training for Rot2DTransformerV2")
     parser.add_argument("--data-root", type=str, required=True)
@@ -287,6 +158,10 @@ def main():
     parser.add_argument("--warmup-epochs", type=int, default=20)
     parser.add_argument("--batch-size", type=int, default=256, help="Per-GPU batch size in DDP mode")
     parser.add_argument("--num-workers", type=int, default=8)
+    parser.add_argument("--amp-dtype", choices=["float16", "bfloat16"], default="float16")
+    parser.add_argument("--fused-adamw", action=argparse.BooleanOptionalAction, default=False)
+    parser.add_argument("--log-interval", type=int, default=50, help="Batch interval for device-to-host loss logging; 0 disables")
+    parser.add_argument("--checkpoint-interval", type=int, default=10, help="Save last.pt every N epochs (0: best only), plus final epoch when N > 0")
 
     parser.add_argument("--lr", type=float, default=1e-3)
     parser.add_argument("--weight-decay", type=float, default=0.05)
@@ -318,9 +193,13 @@ def main():
         default="tiny",
         choices=["tiny", "small", "base", "large"],
     )
-    parser.add_argument("--dims", type=int, nargs=4, default=None, help="Override stage dims")
+    parser.add_argument("--dims", type=int, nargs=4, default=None, help="Override stage regular-field counts (actual channels = fields * group order)")
     parser.add_argument("--depths", type=int, nargs=4, default=None, help="Override stage depths")
     parser.add_argument("--heads", type=int, nargs=4, default=None, help="Override stage heads")
+    parser.add_argument("--image-size", type=int, default=224)
+    parser.add_argument("--stem-downsample", type=int, choices=[2, 4, 8], default=4)
+    parser.add_argument("--attention-backend", choices=["bmm", "sdpa"], default="bmm")
+    parser.add_argument("--fused-qkv", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--window-size", type=int, default=7)
     parser.add_argument("--mlp-ratio", type=int, default=4)
     parser.add_argument("--dropout", type=float, default=0.0)
@@ -353,16 +232,12 @@ def main():
     args = parser.parse_args()
     if args.pretrained and not args.pretrained_path:
         parser.error("--pretrained-path is required when --pretrained is set")
-    seed_everything(args.seed)
+    if args.image_size <= 0 or args.batch_size <= 0 or args.num_workers < 0:
+        parser.error("image size/batch size must be positive and num-workers nonnegative")
+    if not 0 <= args.warmup_epochs < args.epochs:
+        parser.error("Require 0 <= --warmup-epochs < --epochs")
 
-    # ViT-tiny-like default capacity (unless explicitly overridden)
-    presets = {
-        "tiny": {"dims": [12, 24, 48, 96], "depths": [1, 2, 3, 1], "heads": [1, 2, 4, 8]},
-        "small": {"dims": [24, 48, 96, 192], "depths": [1, 2, 4, 1], "heads": [1, 2, 4, 8]},
-        "base": {"dims": [32, 64, 128, 256], "depths": [2, 2, 4, 2], "heads": [1, 2, 4, 8]},
-        "large": {"dims": [64, 128, 192, 384], "depths": [2, 2, 6, 2], "heads": [2, 4, 8, 16]},
-    }
-    preset = presets[args.model_size]
+    preset = MODEL_PRESETS[args.model_size]
     if args.dims is None:
         args.dims = preset["dims"]
     if args.depths is None:
@@ -370,7 +245,21 @@ def main():
     if args.heads is None:
         args.heads = preset["heads"]
 
-    rank, _, local_rank = setup_distributed()
+    stage_sides = []
+    side = (args.image_size + args.stem_downsample - 1) // args.stem_downsample
+    for _ in args.dims:
+        stage_sides.append(side)
+        side = (side + 1) // 2
+    if args.window_size > 0 and any(side % args.window_size for side in stage_sides):
+        warnings.warn(
+            f"Stage sizes {stage_sides} are not all divisible by window size {args.window_size}. "
+            "Legacy bottom/right padding changes attention near edges and breaks window-grid "
+            "rotation/reflection symmetry. Choose aligned sizes for equivariance checks "
+            "(e.g. image=224, window=7, stem=4)."
+        )
+
+    rank, world_size, local_rank = setup_distributed(args.ddp)
+    seed_everything(args.seed + (rank or 0))
     use_ddp = args.ddp and rank is not None
 
     if use_ddp:
@@ -385,6 +274,7 @@ def main():
         batch_size=args.batch_size,
         num_workers=args.num_workers,
         use_ddp=use_ddp,
+        image_size=args.image_size,
         color_jitter=args.color_jitter,
         randaugment=args.randaugment,
         randaugment_num_ops=args.randaugment_num_ops,
@@ -408,8 +298,14 @@ def main():
             f"mixup_prob={args.mixup_prob}, switch_prob={args.mixup_switch_prob}"
         )
 
-    # gspace = gspaces.rot2dOnR2(N=args.group_n)
     gspace = get_gspace(args.group_str)
+    if is_main_process(rank):
+        order = gspace.fibergroup.order()
+        print(f"Geometry: image={args.image_size}, stage_sides={stage_sides}, "
+              f"fields={tuple(args.dims)}, channels={tuple(d * order for d in args.dims)}, "
+              f"group_order={order}, window={args.window_size}, "
+              f"attention={args.attention_backend}, fused_qkv={args.fused_qkv}, "
+              f"amp_dtype={args.amp_dtype}, global_batch={args.batch_size * (world_size or 1)}")
     model = Rot2DTransformerV2(
         gspace=gspace,
         in_channels=3,
@@ -425,7 +321,13 @@ def main():
         qkv_kernel_size=args.qkv_kernel_size,
         use_checkpoint=args.use_checkpoint,
         fast_init=args.fast_init,
+        stem_downsample=args.stem_downsample,
     ).to(device)
+
+    for module in model.modules():
+        if hasattr(module, "use_sdpa"):
+            module.use_sdpa = args.attention_backend == "sdpa"
+            module.fused_qkv = args.fused_qkv
 
     resume_ckpt = None
     if args.pretrained:
@@ -436,7 +338,7 @@ def main():
             print(f"Loaded pretrained weights from {args.pretrained_path}")
 
     if use_ddp:
-        model = DDP(model, device_ids=[local_rank], output_device=local_rank)
+        model = DDP(model, device_ids=[local_rank], output_device=local_rank, broadcast_buffers=False)
     elif args.data_parallel and torch.cuda.device_count() > 1:
         model = nn.DataParallel(model)
 
@@ -444,19 +346,22 @@ def main():
         count_parameters(model)
         os.makedirs(args.output_dir, exist_ok=True)
         os.makedirs(os.path.join(args.output_dir, "checkpoints"), exist_ok=True)
-        # os.makedirs(os.path.join(args.output_dir, "runs"), exist_ok=True)
         writer = SummaryWriter(log_dir=os.path.join(args.output_dir, "runs", f"imagenet_revit_{args.group_str}_{args.model_size}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"))
     else:
         writer = None
 
-    optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
-    warmup_scheduler = LinearLR(optimizer, start_factor=0.03, total_iters=args.warmup_epochs)
-    cosine_scheduler = CosineAnnealingLR(optimizer, T_max=args.epochs - args.warmup_epochs)
-    scheduler = SequentialLR(optimizer, schedulers=[warmup_scheduler, cosine_scheduler], milestones=[args.warmup_epochs])
-    scaler = torch.amp.GradScaler("cuda" if device.type == "cuda" else "cpu", enabled=device.type == "cuda")
+    optimizer = torch.optim.AdamW(
+        model.parameters(), lr=args.lr, weight_decay=args.weight_decay,
+        fused=args.fused_adamw and device.type == "cuda",
+    )
+    scheduler = build_scheduler(optimizer, args.epochs, args.warmup_epochs)
+    amp_dtype = {"float16": torch.float16, "bfloat16": torch.bfloat16}[args.amp_dtype]
+    if device.type == "cuda" and amp_dtype == torch.bfloat16 and not torch.cuda.is_bf16_supported():
+        parser.error("This CUDA device does not support bfloat16")
+    scaler = torch.amp.GradScaler("cuda", enabled=device.type == "cuda" and amp_dtype == torch.float16)
 
     start_epoch = 0
-    best_top1 = 0.0
+    best_top1 = float("-inf")
     best_epoch = -1
     if (
         args.pretrained
@@ -465,11 +370,14 @@ def main():
         and "optimizer_state_dict" in resume_ckpt
         and "scheduler_state_dict" in resume_ckpt
     ):
-        optimizer.load_state_dict(resume_ckpt["optimizer_state_dict"])
-        scheduler.load_state_dict(resume_ckpt["scheduler_state_dict"])
+        saved_epochs = resume_ckpt.get("args", {}).get("epochs")
+        if saved_epochs is not None and saved_epochs != args.epochs:
+            raise ValueError("Resume with the original total --epochs to retain the LR schedule; "
+                             "use --pretrained-weights-only to start a new schedule")
+        restore_training_state(resume_ckpt, optimizer, scheduler, scaler, rank)
         start_epoch = int(resume_ckpt.get("epoch", -1)) + 1
-        best_top1 = float(resume_ckpt.get("top1", 0.0))
-        best_epoch = int(resume_ckpt.get("epoch", -1))
+        best_top1 = float(resume_ckpt.get("best_top1", resume_ckpt.get("top1", 0.0)))
+        best_epoch = int(resume_ckpt.get("best_epoch", resume_ckpt.get("epoch", -1)))
         if is_main_process(rank):
             print(f"Resuming training from epoch {start_epoch} (loaded optimizer and scheduler)")
     elif args.pretrained and resume_ckpt is not None and not args.pretrained_weights_only and is_main_process(rank):
@@ -478,9 +386,10 @@ def main():
                 "Checkpoint has no optimizer/scheduler state; training from epoch 0 with new optimizer/scheduler"
             )
 
+    del resume_ckpt
     best_ckpt_path = None
 
-    for epoch in range(start_epoch, start_epoch + args.epochs):
+    for epoch in range(start_epoch, args.epochs):
         if train_sampler is not None:
             train_sampler.set_epoch(epoch)
 
@@ -497,12 +406,14 @@ def main():
             rank if use_ddp else None,
             grad_clip=args.grad_clip,
             label_smoothing=args.label_smoothing,
+            amp_dtype=amp_dtype,
+            log_interval=args.log_interval,
             mixup_fn=mixup_fn,
             mixup_prob=args.mixup_prob,
         )
         scheduler.step()
 
-        val_loss, top1, top5 = evaluate(model, val_loader, device, rank if use_ddp else None)
+        val_loss, top1, top5 = evaluate(model, val_loader, device, rank if use_ddp else None, amp_dtype=amp_dtype)
 
         if is_main_process(rank):
             writer.add_scalar("train/loss", train_loss, epoch)
@@ -513,21 +424,19 @@ def main():
                 f"Epoch {epoch:03d} | train_loss={train_loss:.4f} | val_loss={val_loss:.4f} | top1={top1:.4f} | top5={top5:.4f}"
             )
 
-            if top1 > best_top1:
-                best_top1 = top1
-                best_epoch = epoch
-                best_ckpt_path = os.path.join(
-                    args.output_dir, "checkpoints", f"imagenet_es_v2_best_epoch_{best_epoch}.pt"
-                )
-                save_training_checkpoint(
-                    best_ckpt_path,
-                    model,
-                    optimizer,
-                    scheduler,
-                    best_epoch,
-                    best_top1,
-                    device,
-                )
+        if top1 > best_top1:
+            best_top1, best_epoch = top1, epoch
+            best_ckpt_path = os.path.join(args.output_dir, "checkpoints", "best.pt")
+            save_training_checkpoint(
+                best_ckpt_path, model, optimizer, scheduler, epoch, top1, device,
+                scaler=scaler, args=args, best_top1=best_top1, best_epoch=best_epoch,
+            )
+        if args.checkpoint_interval > 0 and ((epoch + 1) % args.checkpoint_interval == 0 or epoch + 1 == args.epochs):
+            save_training_checkpoint(
+                os.path.join(args.output_dir, "checkpoints", "last.pt"),
+                model, optimizer, scheduler, epoch, top1, device,
+                scaler=scaler, args=args, best_top1=best_top1, best_epoch=best_epoch,
+            )
 
     if is_main_process(rank):
         writer.close()

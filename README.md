@@ -138,6 +138,22 @@ python imagenet_train_revit.py \
 
 Use `--pretrained-weights-only` to load only model weights and start optimizer/scheduler fresh.
 
+`--epochs` is the total target, including completed epochs when resuming. New
+checkpoints store optimizer, scheduler, scaler, configuration and per-rank RNG
+state. `checkpoints/best.pt` keeps the best model; `last.pt` is saved every
+`--checkpoint-interval` epochs (default 10) and at the final epoch. Set the
+interval to 0 for best-only saving. Resume with the original total epoch count
+and model configuration. Old checkpoint dictionaries are supported; use
+`imagenet_utils.load_model_state()` when loading raw exported model states.
+
+Execution options include `--no-fused-qkv`, `--attention-backend bmm|sdpa`,
+`--amp-dtype float16|bfloat16`, `--fused-adamw`, and `--log-interval 50`.
+The defaults retain bmm and FP16; benchmark optional backends on the target
+hardware. `--image-size` and `--stem-downsample` expose resolution experiments.
+Stage dimensions count **regular fields**: actual channels equal the field
+count times group order (D4 has order 8). Geometry and width changes can affect
+accuracy and equivariance; see the analysis below.
+
 ### 3) ImageNet baseline — vanilla ViT-Small
 
 ```bash
@@ -159,6 +175,37 @@ torchrun --standalone --nproc_per_node=4 imagenet_train_vit.py \
 - `large`: dims `64,128,192,384`; depths `2,2,6,2`; heads `2,4,8,16`
 
 You can override with `--dims`, `--depths`, and `--heads`.
+
+## Scaling analysis and optimization verification
+
+- [ImageNet architecture, parameter/FLOP scaling and equivariance limits](analysis/IMAGENET_ANALYSIS.txt)
+- [Applied changes, CPU timings, tests and accuracy-validation limits](analysis/OPTIMIZATION_REPORT.txt)
+- [Reproduction commands and environment notes](analysis/REPRODUCTION.txt)
+
+Generate per-image estimates (2 FLOPs per multiply-add), optionally building
+models for exact constrained parameter counts:
+
+```bash
+python scripts/profile_scaling.py --model-sizes tiny small --groups C4 D4 \
+  --image-sizes 224 448 --kernel-sizes 1 3 --exact-parameters \
+  --output analysis/scaling_results.json
+
+python scripts/benchmark_optimizations.py --baseline-ref 2558962 \
+  --model-size tiny --group D4 --qkv-kernel-size 3 --device cuda \
+  --dtype float16 --batch-size 32 --output benchmark_results/optimization.json
+
+pip install pytest
+python -m pytest -q
+```
+
+FLOP estimates count dense convolutions, linears and attention matrix products;
+they exclude kernel-basis expansion, softmax, backward and optimizer work.
+CPU timing evidence is included under `analysis/`; CUDA speed and ImageNet
+accuracy still require target-hardware runs. Tests cover aligned C4/D4 window
+attention, numerical/gradient equivalence, checkpoint state and distributed
+validation. The original full model has stride-phase and window-grid limits;
+these execution changes preserve its function without claiming exact spatial
+equivariance for every image size or nominal group.
 
 ## Monitoring
 

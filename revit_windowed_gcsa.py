@@ -1,4 +1,5 @@
 import math
+from contextlib import nullcontext
 from typing import Optional, Tuple
 
 import torch
@@ -6,6 +7,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 import torch.utils.checkpoint as checkpoint
 from escnn import gspaces
+from equivariant_ops import project_qkv, preserve_batchnorm_buffers
 from escnn.nn import (
     FieldType,
     GeometricTensor,
@@ -43,7 +45,7 @@ class DropPath(nn.Module):
 
 
 class Rot2DStem(nn.Module):
-    def __init__(self, gspace, in_channels: int, out_type: FieldType, downsample: int = 4):
+    def __init__(self, gspace, in_channels: int, out_type: FieldType, downsample: int = 4, initialize: bool = True):
         super().__init__()
         if downsample not in (2, 4, 8):
             raise ValueError(f"downsample must be 2, 4, or 8, got {downsample}")
@@ -63,7 +65,7 @@ class Rot2DStem(nn.Module):
                 in_t, k, pad = mid_type, 3, 1
             out_t = out_type if i == n_layers - 1 else mid_type
             layers.extend([
-                R2Conv(in_t, out_t, kernel_size=k, stride=2, padding=pad, bias=False),
+                R2Conv(in_t, out_t, kernel_size=k, stride=2, padding=pad, bias=False, initialize=initialize),
                 InnerBatchNorm(out_t),
                 ReLU(out_t),
             ])
@@ -74,9 +76,9 @@ class Rot2DStem(nn.Module):
 
 
 class Rot2DDownsample(nn.Module):
-    def __init__(self, in_type: FieldType, out_type: FieldType):
+    def __init__(self, in_type: FieldType, out_type: FieldType, initialize: bool = True):
         super().__init__()
-        self.conv = R2Conv(in_type, out_type, kernel_size=3, stride=2, padding=1, bias=False)
+        self.conv = R2Conv(in_type, out_type, kernel_size=3, stride=2, padding=1, bias=False, initialize=initialize)
         self.bn = InnerBatchNorm(out_type)
         self.act = ReLU(out_type)
 
@@ -93,10 +95,15 @@ class Rot2DWindowAttention(nn.Module):
         qkv_kernel_size: int = 1,
         attn_dropout: float = 0.0,
         proj_dropout: float = 0.0,
+        initialize: bool = True,
     ):
         super().__init__()
-        assert len(in_type.representations) % num_heads == 0, "repr count must divide heads"
-        assert window_size > 0 and qkv_kernel_size % 2 == 1
+        if num_heads <= 0 or len(in_type.representations) % num_heads:
+            raise ValueError("The positive head count must divide the regular-field count")
+        if window_size <= 0 or qkv_kernel_size <= 0 or qkv_kernel_size % 2 != 1:
+            raise ValueError("window_size must be positive and qkv_kernel_size positive and odd")
+        if any(r != in_type.gspace.regular_repr for r in in_type.representations):
+            raise ValueError("Attention heads require complete regular fields")
 
         self.in_type = in_type
         self.num_heads = num_heads
@@ -107,12 +114,13 @@ class Rot2DWindowAttention(nn.Module):
         # here — 7x7 windows are too small for fused kernels to win — so bmm stays
         # the default. Global attention (revit_gcsa.py) defaults to SDPA instead.
         self.use_sdpa = False
+        self.fused_qkv = True
 
         pad = (qkv_kernel_size - 1) // 2
-        self.to_q = R2Conv(in_type, in_type, qkv_kernel_size, padding=pad, bias=False)
-        self.to_k = R2Conv(in_type, in_type, qkv_kernel_size, padding=pad, bias=False)
-        self.to_v = R2Conv(in_type, in_type, qkv_kernel_size, padding=pad, bias=False)
-        self.to_out = R2Conv(in_type, in_type, 1, bias=False)
+        self.to_q = R2Conv(in_type, in_type, qkv_kernel_size, padding=pad, bias=False, initialize=initialize)
+        self.to_k = R2Conv(in_type, in_type, qkv_kernel_size, padding=pad, bias=False, initialize=initialize)
+        self.to_v = R2Conv(in_type, in_type, qkv_kernel_size, padding=pad, bias=False, initialize=initialize)
+        self.to_out = R2Conv(in_type, in_type, 1, bias=False, initialize=initialize)
 
         self.attn_dropout = nn.Dropout(attn_dropout)
         self.proj_dropout = PointwiseDropout(in_type, p=proj_dropout)
@@ -140,19 +148,14 @@ class Rot2DWindowAttention(nn.Module):
         return x[:, :, :h, :w]
 
     def forward(self, x: GeometricTensor) -> GeometricTensor:
-        q = self.to_q(x).tensor
-        k = self.to_k(x).tensor
-        v = self.to_v(x).tensor
-
-        qw, meta = self._window_partition(q)
-        kw, _ = self._window_partition(k)
-        vw, _ = self._window_partition(v)
-
-        bnw, c, ws, _ = qw.shape
+        qkv = project_qkv(x, self.to_q, self.to_k, self.to_v, self.fused_qkv, packed=True)
+        # Partition once while projections share a tensor. Head boundaries still
+        # contain complete regular fields, independently for Q, K and V.
+        windows, meta = self._window_partition(qkv)
+        bnw, three_c, ws, _ = windows.shape
+        c = three_c // 3
         n = ws * ws
-        qh = qw.view(bnw, self.num_heads, self.head_dim, n).transpose(-2, -1)
-        kh = kw.view(bnw, self.num_heads, self.head_dim, n).transpose(-2, -1)
-        vh = vw.view(bnw, self.num_heads, self.head_dim, n).transpose(-2, -1)
+        qh, kh, vh = windows.view(bnw, 3, self.num_heads, self.head_dim, n).permute(1, 0, 2, 4, 3).unbind(0)
 
         if self.use_sdpa:
             # same math as below; scale defaults to 1/sqrt(head_dim).
@@ -163,7 +166,6 @@ class Rot2DWindowAttention(nn.Module):
             )
         else:
             attn = torch.matmul(qh, kh.transpose(-2, -1)) / math.sqrt(self.head_dim)
-            attn = attn - attn.amax(dim=-1, keepdim=True)
             attn = torch.softmax(attn, dim=-1)
             attn = self.attn_dropout(attn)
             out = torch.matmul(attn, vh)
@@ -176,15 +178,15 @@ class Rot2DWindowAttention(nn.Module):
 
 
 class Rot2DMLP(nn.Module):
-    def __init__(self, in_type: FieldType, hidden_mult: int = 4, dropout: float = 0.0):
+    def __init__(self, in_type: FieldType, hidden_mult: int = 4, dropout: float = 0.0, initialize: bool = True):
         super().__init__()
         hidden_type = FieldType(in_type.gspace, hidden_mult * in_type.representations)
         self.net = nn.Sequential(
-            R2Conv(in_type, hidden_type, 1, bias=False),
+            R2Conv(in_type, hidden_type, 1, bias=False, initialize=initialize),
             InnerBatchNorm(hidden_type),
             ReLU(hidden_type),
             PointwiseDropout(hidden_type, p=dropout),
-            R2Conv(hidden_type, in_type, 1, bias=False),
+            R2Conv(hidden_type, in_type, 1, bias=False, initialize=initialize),
             InnerBatchNorm(in_type),
             PointwiseDropout(in_type, p=dropout),
         )
@@ -205,6 +207,7 @@ class Rot2DBlockV2(nn.Module):
         drop_path: float,
         qkv_kernel_size: int,
         use_checkpoint: bool,
+        initialize: bool = True,
     ):
         super().__init__()
         self.norm1 = InnerBatchNorm(in_type)
@@ -216,8 +219,9 @@ class Rot2DBlockV2(nn.Module):
             qkv_kernel_size=qkv_kernel_size,
             attn_dropout=attn_dropout,
             proj_dropout=dropout,
+            initialize=initialize,
         )
-        self.mlp = Rot2DMLP(in_type, hidden_mult=mlp_ratio, dropout=dropout)
+        self.mlp = Rot2DMLP(in_type, hidden_mult=mlp_ratio, dropout=dropout, initialize=initialize)
         self.drop_path1 = DropPath(drop_path)
         self.drop_path2 = DropPath(drop_path)
         self.alpha1 = nn.Parameter(torch.ones(1))
@@ -239,7 +243,10 @@ class Rot2DBlockV2(nn.Module):
             gx = GeometricTensor(tensor, xtype)
             return self._forward_impl(gx).tensor
 
-        out_t = checkpoint.checkpoint(_fn, x.tensor, use_reentrant=False)
+        out_t = checkpoint.checkpoint(
+            _fn, x.tensor, use_reentrant=False,
+            context_fn=lambda: (nullcontext(), preserve_batchnorm_buffers(self)),
+        )
         return GeometricTensor(out_t, xtype)
 
 
@@ -303,12 +310,17 @@ class Rot2DTransformerV2(nn.Module):
         stem_downsample: int = 4,
     ):
         super().__init__()
-        assert len(dims) == len(depths) == len(heads)
+        if not (len(dims) == len(depths) == len(heads) == 4):
+            raise ValueError("dims, depths and heads must each contain four entries")
+        if any(d <= 0 or n <= 0 or h <= 0 or d % h for d, n, h in zip(dims, depths, heads)):
+            raise ValueError("Positive stage dimensions and depths required; heads must divide dims")
+        if mlp_ratio <= 0 or not 0 <= drop_path_rate < 1:
+            raise ValueError("mlp_ratio must be positive and drop_path_rate in [0, 1)")
         self.gspace = gspace
         self.fast_init = fast_init
 
         stage_types = [FieldType(gspace, d * [gspace.regular_repr]) for d in dims]
-        self.stem = Rot2DStem(gspace, in_channels, stage_types[0], downsample=stem_downsample)
+        self.stem = Rot2DStem(gspace, in_channels, stage_types[0], downsample=stem_downsample, initialize=False)
 
         total_blocks = sum(depths)
         dpr = torch.linspace(0, drop_path_rate, total_blocks).tolist()
@@ -329,16 +341,21 @@ class Rot2DTransformerV2(nn.Module):
                         drop_path=dpr[dpr_idx],
                         qkv_kernel_size=qkv_kernel_size,
                         use_checkpoint=use_checkpoint,
+                        initialize=False,
                     )
                 )
                 dpr_idx += 1
 
-            downsample = Rot2DDownsample(stage_types[i], stage_types[i + 1]) if i < (len(dims) - 1) else None
+            downsample = Rot2DDownsample(stage_types[i], stage_types[i + 1], initialize=False) if i < (len(dims) - 1) else None
             stages.append(Rot2DStage(nn.ModuleList(blocks), downsample))
 
         self.stages = nn.ModuleList(stages)
         self.head = Rot2DClassificationHeadV2(stage_types[-1], gspace, num_classes=num_classes, dropout=dropout)
         self._initialize_weights()
+        # R2Conv constructors allocate zero-valued eval filter buffers even in
+        # training mode. Drop them before .to(device); eval() rebuilds them from
+        # learned coefficients. This can save hundreds of MB during GPU setup.
+        self.train()
 
     def _initialize_weights(self):
         has_general_orth = hasattr(init, "general_orthogonal_init")

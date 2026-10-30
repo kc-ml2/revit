@@ -1,0 +1,278 @@
+Applied revisions, performance evidence and verification
+Date: 2026-10-28
+Repository baseline: 2558962
+
+1. Model execution changes
+
+equivariant_ops.py adds project_qkv(). During training it asks each of the
+original to_q/to_k/to_v R2Conv modules to expand its own constrained kernel,
+concatenates those kernels along output channels and executes one conv2d.
+During evaluation it uses ESCNN's cached expansions. Gradients still flow
+to the original coefficient vectors through the original basis expansions.
+The learned parameter names and shapes remain to_q/to_k/to_v; checkpoint
+weights require no merging, approximation or new unconstrained parameters.
+Only the matching bias-free projection geometry used here is supported.
+
+Both global attention classes and the ImageNet windowed attention use the
+helper. The windowed path keeps QKV packed and partitions their combined
+map once instead of running three separate pad/reshape/permute/copy paths.
+Complete regular fields remain together in every head. Its FLOPs and
+trainable parameter count are unchanged; the intended savings come from
+fewer convolution launches, shared input access and less packing overhead.
+Fusion temporarily concatenates expanded kernels and may increase peak
+memory on some devices/shapes. It is reversible with --no-fused-qkv in the
+ImageNet trainer or module.fused_qkv=False in model-level experiments.
+
+The explicit attention path no longer separately subtracts a row maximum
+before torch.softmax, which already performs stable normalization. This
+removes a redundant reduction and score-sized intermediate. It does not
+fix overflow that already occurred in a low-precision QK product; SDPA or
+the optional BF16 path should be evaluated for such cases. FP16/bmm remain
+the training defaults. --attention-backend selects bmm or sdpa explicitly;
+there is no claim that one kernel is fastest on every GPU. Global attention
+retains its original SDPA default. Head splitting and the 1/sqrt(head_dim)
+scale are unchanged. Dropout is passed to SDPA only during training.
+
+Rot2DTransformerV2 now disables R2Conv's default initialization when its
+own model-level initializer is going to overwrite those coefficients.
+Standalone stem, attention, MLP and downsample constructors still initialize
+by default. The model's final initialization algorithm is unchanged;
+--fast-init remains an explicit debug option and is not enabled for normal
+training. Skipping a discarded random initialization changes RNG consumption,
+so a fresh run with the same seed need not start from the old exact weights.
+Comparisons of execution use copied learned weights instead.
+
+Both full-model constructors discard R2Conv's initially allocated zero
+expanded-filter caches by entering training mode after initialization.
+They do this before .to(device). eval() rebuilds valid kernels from the
+coefficients normally. For small D4 k=3, the unused dense filters total
+195,920,928 FP32 elements: about 747.38 MiB. The remaining unique model
+buffers at construction are 41,476 elements. This reduces initial device
+transfer/allocation and avoids storing obsolete initial caches. Training
+still needs actual expanded kernels and their autograd intermediates;
+the change does not eliminate that genuine dense convolution cost.
+
+The V2 constructor now validates positive dimensions/depths/head counts,
+complete-field head divisibility, positive odd QKV kernels and valid
+stochastic-depth range. The trainer warns when image/stem/window choices
+require the legacy asymmetric window padding. Existing boundary outputs
+are retained. See IMAGENET_ANALYSIS.txt for why strict end-to-end spatial
+equivariance was not already guaranteed by the original architecture.
+
+2. Activation checkpoint correctness
+
+The original --use-checkpoint recomputed InnerBatchNorm in training mode,
+updating running_mean, running_var and num_batches_tracked a second time
+during backward. That changes future evaluation even when outputs and
+gradients appear correct.
+
+The non-reentrant checkpoint now supplies a recomputation context which
+snapshots and restores the underlying PyTorch BatchNorm buffers. The
+recomputed forward still uses training batch statistics and the same
+autograd operations. It does not switch BN to eval or disable tracking,
+which would differentiate a different function or change saved tensors.
+PyTorch's RNG preservation remains enabled. Tests with attention dropout,
+pointwise dropout and DropPath verify matching outputs, input/parameter
+gradients and all running-stat buffers with checkpointing on versus off.
+Checkpointing is a memory/compute tradeoff, not an automatic speedup; it
+is useful when the reduced activation memory enables the desired batch.
+
+3. Training and validation changes
+
+imagenet_utils.py consolidates execution utilities used by both ImageNet
+entrypoints. Architecture and augmentation choices remain in the entrypoints.
+
+Loss/correct-count accumulators now stay on the training device. The old
+loops called loss.item() every batch (twice in training), and validation
+called .item() for loss, top1 and top5 every batch. These force host/device
+synchronization. Training now logs once every --log-interval batches
+(default 50; 0 disables batch loss logging), reduces metrics once per epoch
+and weights loss by sample count rather than equally weighting a smaller
+last batch. Validation transfers only its final reduced totals to the host.
+Autograd is not retained in these accumulators.
+
+DDP now uses broadcast_buffers=False. ESCNN's large sampled bases and
+derived filters do not need to be broadcast on every forward. BN training
+normalization uses each rank's current batch, as before; this is not a
+switch to SyncBatchNorm. Rank zero's running BN statistics are synchronized
+once before validation. On rank zero their running-stat update sequence is
+the same as ordinary local-batch BN. No batch size or LR scaling rule was
+silently changed. --batch-size remains per GPU.
+
+The original DistributedSampler padded validation with duplicate examples
+when the dataset size was not divisible by world size. For 50,000 examples
+and three ranks it evaluated 50,001 samples. DistributedEvalSampler now
+assigns each example exactly once, including when a rank has no examples.
+Validation unwraps DDP and uses no per-forward distributed collectives,
+so unequal numbers of validation batches cannot deadlock. BN buffers are
+synchronized once, then sums/counts are all-reduced once at the end.
+Metrics can change slightly because the original duplicate weighting was
+incorrect, not because classifier predictions changed.
+
+setup_distributed now selects the CUDA device before NCCL initialization,
+requires torchrun for --ddp and rejects a torchrun launch without --ddp.
+The previous code initialized a process group even without --ddp and could
+silently run independent models on ranks. After setup, rank-specific seeds
+give independent augmentation/dropout streams. DDP still synchronizes
+learned initial model weights. num_workers=0 remains supported; pinned
+memory and persistent workers retain the existing loader defaults.
+
+Both trainers have a shared configurable precision path. FP16 AMP plus
+GradScaler remains the default on CUDA. --amp-dtype bfloat16 checks device
+support and disables unnecessary loss scaling for BF16. --fused-adamw is
+opt-in and only enabled on CUDA; the original AdamW hyperparameters and
+parameter groups remain. These optional numeric implementations need target
+hardware and full training validation; no TF32/precision relaxation was
+enabled silently.
+
+The original ViT CLI exposed --image-size but always cropped data to 224.
+Both loaders now honor the chosen size in training and validation, keeping
+the original 256/224 validation resize ratio. REViT now exposes --image-size
+and the existing model's --stem-downsample knob. Defaults remain 224 and 4.
+These geometry options are for measured experiments, not evidence that
+resolution/stride changes preserve accuracy or exact equivariance.
+
+4. Checkpoints, resume and scheduling
+
+REViT's old resumed loop ran range(start_epoch, start_epoch + args.epochs),
+adding another full training budget and running beyond the cosine schedule.
+It now runs range(start_epoch, args.epochs): --epochs is the total target.
+Zero warmup is supported by using cosine directly. Invalid warmup/epoch
+ranges are rejected before training. New checkpoint metadata checks that
+resumed total epochs match the saved schedule; weights-only loading starts
+a fresh schedule when that is intended.
+
+Checkpoints now contain canonical unwrapped learned state and persistent
+basis/BN buffers, without ESCNN's regenerable expanded filter/expanded_bias
+caches. This avoids duplicating enormous dense kernels in saved weights.
+For the small D4 k=3 model, this also avoids approximately 747.38 MiB of
+FP32 filter data in an eval-mode checkpoint. The model and optimizer are
+saved as CPU tensors. Files are written to a temporary path and atomically
+replaced; no torch.cuda.empty_cache() is forced after each save.
+
+The strict loading helper accepts original checkpoints with module. prefixes
+and eval-mode expanded-filter buffers. It discards only those derived keys,
+normalizes the destination to training mode and strictly loads the real
+parameters/buffers. This avoids the ESCNN eval-versus-train buffer mismatch.
+The existing pretrained checkpoint-dictionary format remains supported.
+For a raw exported .pth state dict, use load_model_state(model, state).
+
+New checkpoints also save GradScaler state, scheduler/optimizer states,
+best score/epoch, CLI configuration and each rank's Python/NumPy/Torch/CUDA
+RNG state. All ranks participate in RNG collection; only rank zero writes.
+Resume restores these states and verifies world-size compatibility for RNG
+restoration. Original checkpoints without the new states remain loadable,
+but cannot provide the missing scaler/RNG information retroactively.
+
+Best checkpoints use best.pt instead of accumulating a new file on every
+improvement. Periodic last.pt uses --checkpoint-interval (default 10; 0
+means best only). With a positive interval the final epoch is also saved.
+The ViT trainer no longer keeps a deep copy of the best model on the GPU;
+it exports from the CPU checkpoint. The REViT trainer now releases the
+loaded resume payload after restoring it, avoiding retained optimizer copies.
+
+RNG restoration does NOT promise bitwise resumption with persistent worker
+processes, a changed world size/batch size, nondeterministic CUDA kernels,
+or different precision/backends. Worker-local augmentation RNG is not
+checkpointed. The tested exact-resume claim below uses num_workers=0 on CPU.
+Retain the full original configuration and dataset for comparable resumes.
+
+5. Measured performance and numerical evidence
+
+Environment: macOS arm64 CPU, PyTorch 2.9.1, torchvision 0.24.1, ESCNN
+1.0.11, NumPy 1.26.4. Python 3.12.14. No CUDA device or ImageNet dataset
+was used. Benchmarks use FP32, one CPU thread, batch=2, 224x224, r=4,
+window=7, stochastic depth/dropout disabled, copied original weights,
+three warmup iterations and ten timed iterations. The baseline model is
+loaded directly from Git revision 2558962. Every variant resets learned
+and BatchNorm state before its numerical check. Training timings include
+forward/backward and gradient clearing, not an optimizer or input pipeline.
+
+Tiny D4, QKV k=3 (cpu_benchmark.json):
+                                 forward ms   forward+backward ms
+  original bmm, separate QKV          78.314          241.756
+  revised bmm, fused/packed QKV       70.481          209.312
+  revised SDPA, fused/packed QKV      71.900          215.141
+
+The default revised bmm path reduced this measured forward time by about
+10.0% and training-step time by about 13.4% (roughly 1.16x throughput for
+the synthetic forward/backward workload). FP32 bmm logits matched exactly
+in this sample; SDPA's maximum absolute logit difference was 9.31e-9.
+The original and revised bmm full-model rotation errors matched as well.
+
+Tiny C4, QKV k=1 (cpu_benchmark_c4_k1.json):
+                                 forward ms   forward+backward ms
+  original bmm, separate QKV          20.403           60.604
+  revised bmm, fused/packed QKV       20.754           59.023
+  revised SDPA, fused/packed QKV      21.229           62.693
+
+This smaller case improves training time only about 2.6%; forward is about
+1.7% slower in this run. Small differences are subject to timing variability.
+The evidence supports retaining selectable backends and a fusion fallback,
+not advertising universal speedups. GPU speed, memory and AMP numerics
+have NOT been measured. Run the supplied benchmark with the intended CUDA
+device, precision and batch size before choosing deployment settings.
+
+Construction timings are also recorded (e.g. 16.929s original versus
+12.769s revised in the D4 run). The original is built first and can incur
+cold basis-building overhead while the second model reuses cached bases;
+these figures must not be interpreted as an isolated initialization speedup.
+The removed redundant initialization and discarded cache allocations are
+direct code-level savings independent of that timing confounder.
+
+6. Verification completed
+
+37 automated tests passed; raw output is in test_results.txt. They cover:
+  - FP64 fused/unfused QKV outputs and input/coefficient gradients for
+    C4/D4, kernels 1/3, and training/evaluation modes;
+  - all C4/D4 elements on aligned window attention, both kernels and
+    bmm/SDPA, with full regular fields in heads;
+  - bmm/unfused versus SDPA/fused outputs and gradients for windowed,
+    global and convolutional-global attention;
+  - checkpoint outputs, gradients, stochastic masks and BN running state;
+  - original eval/DDP checkpoint-key compatibility and fused model logits;
+  - finite default initialization/gradients and absent unused filter caches;
+  - exact distributed validation coverage including empty shards;
+  - real two-process CPU/Gloo uneven/empty-shard evaluation and collective
+    checkpoint saving, with BN statistics deliberately different by rank;
+  - sample-weighted losses, RNG/optimizer/scheduler restoration and atomic
+    checkpoint replacement;
+  - zero/nonzero warmup and both image-size-aware data loaders;
+  - analytic convolution/linear/attention counts against executed layer
+    shapes, and ViT parameter formulas against torchvision.
+
+A two-epoch end-to-end REViT training smoke run used ImageFolder data,
+Mixup/CutMix, label smoothing, D4, k=3, activation checkpointing, CPU and
+num_workers=0. The synthetic set had four training and four validation
+RGB images, two classes, image=64/window=2, and deliberately small widths.
+Resuming the epoch-0 best checkpoint with the original total target=2 ran
+only epoch 1. Its final model state, including BN buffers, matched the
+uninterrupted run exactly (maximum absolute difference=0), and scheduler
+states matched. See smoke_resume_results.json and the two smoke logs.
+This is a pipeline/resume test, not an ImageNet accuracy result.
+
+Python compilation and git diff --check also passed. The CPU test
+environment omits optional py3nj, so ESCNN warns about its slower SO(3)
+fallback; these models use finite 2D groups and do not exercise SO(3).
+Pinned-memory warnings are expected for CPU-only execution. Gloo required
+local loopback access outside the restricted execution sandbox.
+
+7. Accuracy and equivariance acceptance on real training hardware
+
+The execution changes retain model capacity, constrained coefficients,
+neighborhoods, head structure, optimizer hyperparameters and augmentation
+defaults. Numerical/gradient checks support preserving predictions for
+identical weights; checkpoint and validation fixes correct actual bugs.
+They do not establish a final ImageNet top-1/top-5 guarantee. A full paired
+training/evaluation comparison is still required, especially for BF16,
+SDPA dropout, fused AdamW or any architecture/geometry changes.
+
+For a production decision, benchmark original and revised model code on
+the target CUDA device with the intended batch/precision, then compare
+ImageNet training using the same data split, configuration and recorded
+seeds. Measure examples/sec, peak allocated memory, validation top1/top5
+and group-transformed predictions. Account for the original validation
+padding bias and resume bugs when interpreting old runs. Repeat accuracy
+runs when differences are comparable to normal seed variance. Do not claim
+strict full-model equivariance from the layer tests: existing stride-phase
+and window-group limitations are detailed in IMAGENET_ANALYSIS.txt.

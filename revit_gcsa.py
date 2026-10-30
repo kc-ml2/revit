@@ -2,6 +2,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from escnn import gspaces
+from equivariant_ops import project_qkv
 from torch.amp import autocast
 from escnn.nn import (
     FieldType, GeometricTensor, Linear,
@@ -26,9 +27,9 @@ def _sdpa_spatial(q, k, v, num_heads, dropout_p):
     B, C, H, W = q.shape
     hd = C // num_heads
     # contiguous: fused SDPA kernels require stride-1 last dim, else silent math fallback
-    qf = q.view(B, num_heads, hd, H * W).transpose(-2, -1).contiguous()
-    kf = k.view(B, num_heads, hd, H * W).transpose(-2, -1).contiguous()
-    vf = v.view(B, num_heads, hd, H * W).transpose(-2, -1).contiguous()
+    qf = q.reshape(B, num_heads, hd, H * W).transpose(-2, -1).contiguous()
+    kf = k.reshape(B, num_heads, hd, H * W).transpose(-2, -1).contiguous()
+    vf = v.reshape(B, num_heads, hd, H * W).transpose(-2, -1).contiguous()
     out = F.scaled_dot_product_attention(qf, kf, vf, dropout_p=dropout_p)
     return out.transpose(-2, -1).reshape(B, C, H, W)
 
@@ -102,15 +103,15 @@ class Rot2DMultiHeadAttention(nn.Module):
         self.attn_dropout = nn.Dropout(attn_dropout)
         self.dropout = PointwiseDropout(in_type, dropout)
         self.use_sdpa = True
+        self.fused_qkv = True
 
     def _split_heads(self, x):
         chunks = x.tensor.chunk(self.num_heads, dim=1)
         return [GeometricTensor(t, self.head_type) for t in chunks]
 
     def forward(self, x):
-        q = self.to_q(x)
-        k = self.to_k(x)
-        v = self.to_v(x)
+        qt, kt, vt = project_qkv(x, self.to_q, self.to_k, self.to_v, self.fused_qkv)
+        q, k, v = (GeometricTensor(t, self.in_type) for t in (qt, kt, vt))
 
         if self.use_sdpa:
             out = _sdpa_spatial(
@@ -210,6 +211,7 @@ class Rot2DConvMultiHeadAttention(nn.Module):
         self.attn_dropout = nn.Dropout(attn_dropout)
         self.dropout = PointwiseDropout(in_type, dropout)
         self.use_sdpa = True
+        self.fused_qkv = True
 
     def _split_heads(self, x):
         """Split the channel dimension into multiple heads"""
@@ -228,9 +230,8 @@ class Rot2DConvMultiHeadAttention(nn.Module):
         """
         # with autocast(device_type="cuda", enabled=False):
         # Convolutional projections for Q, K, V
-        q = self.to_q(x)
-        k = self.to_k(x)
-        v = self.to_v(x)
+        qt, kt, vt = project_qkv(x, self.to_q, self.to_k, self.to_v, self.fused_qkv)
+        q, k, v = (GeometricTensor(t, self.in_type) for t in (qt, kt, vt))
 
         if self.use_sdpa:
             out = _sdpa_spatial(
@@ -258,7 +259,6 @@ class Rot2DConvMultiHeadAttention(nn.Module):
             
             # Compute attention scores: [B, HW, HW]
             scores = torch.bmm(qi_flat.transpose(1, 2), ki_flat) / (head_dim ** 0.5)
-            scores = scores - scores.amax(dim=-1, keepdim=True)
 
             # Apply softmax to get attention weights
             attn_weights = torch.softmax(scores, dim=-1)  # [B, HW, HW]
@@ -401,6 +401,10 @@ class Rot2DTransformer(nn.Module):
             num_classes
         )
         self._initialize_weights()
+        # R2Conv constructors allocate zero-valued eval filter buffers even in
+        # training mode. Drop them before .to(device); eval() rebuilds them from
+        # learned coefficients. This can save hundreds of MB during GPU setup.
+        self.train()
 
     def _initialize_weights(self):
         """Initialize weights properly for equivariant layers"""
