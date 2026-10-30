@@ -13,6 +13,10 @@ import json
 import os
 import statistics
 import time
+from pathlib import Path
+import sys
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 import torch
 
@@ -20,11 +24,7 @@ from group_space import get_gspace
 from revit_gcsa import Rot2DTransformer
 from revit_windowed_gcsa import Rot2DTransformerV2
 
-# presets from imagenet_train_revit.py
-PRESETS = {
-    "small": {"dims": (24, 48, 96, 192), "depths": (1, 2, 4, 1), "heads": (1, 2, 4, 8)},
-    "base": {"dims": (64, 128, 256, 512), "depths": (2, 2, 6, 2), "heads": (2, 4, 8, 16)},
-}
+from model_config import MODEL_PRESETS as PRESETS
 
 
 def build_v2(preset, group):

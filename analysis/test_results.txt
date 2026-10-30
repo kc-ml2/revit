@@ -1,0 +1,13 @@
+.....................................                                    [100%]
+=============================== warnings summary ===============================
+.venv/lib/python3.12/site-packages/escnn/group/groups/so3group.py:20
+  /Users/sheir/Documents/ChatGPT/revit_optim/revit/.venv/lib/python3.12/site-packages/escnn/group/groups/so3group.py:20: UserWarning: `py3nj` package not found! Will use a numerical method to compute the SO(3) Clebsh-Gordan coefficents. This is much slower but the coefficients will be cached on disk.
+    warnings.warn("`py3nj` package not found! Will use a numerical method to compute the SO(3) Clebsh-Gordan coefficents. This is much slower but the coefficients will be cached on disk.")
+
+tests/test_imagenet_training.py::test_configured_image_size_reaches_both_loaders[revit]
+tests/test_imagenet_training.py::test_configured_image_size_reaches_both_loaders[vit]
+  /Users/sheir/Documents/ChatGPT/revit_optim/revit/.venv/lib/python3.12/site-packages/torch/utils/data/dataloader.py:692: UserWarning: 'pin_memory' argument is set as true but not supported on MPS now, device pinned memory won't be used.
+    warnings.warn(warn_msg)
+
+-- Docs: https://docs.pytest.org/en/stable/how-to/capture-warnings.html
+37 passed, 3 warnings in 5.33s

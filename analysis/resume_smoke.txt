@@ -1,0 +1,13 @@
+/Users/sheir/Documents/ChatGPT/revit_optim/revit/.venv/lib/python3.12/site-packages/escnn/group/groups/so3group.py:20: UserWarning: `py3nj` package not found! Will use a numerical method to compute the SO(3) Clebsh-Gordan coefficents. This is much slower but the coefficients will be cached on disk.
+  warnings.warn("`py3nj` package not found! Will use a numerical method to compute the SO(3) Clebsh-Gordan coefficents. This is much slower but the coefficients will be cached on disk.")
+Augmentations: color_jitter=True, randaugment=False(ops=2,m=9), random_erase=0.25, mixup=0.8, cutmix=1.0, mixup_prob=1.0, switch_prob=0.5
+Loaded pretrained weights from /tmp/revit_train_smoke/checkpoints/best.pt
+Total Parameters: 28045
+Trainable Parameters: 28045
+Resuming training from epoch 1 (loaded optimizer and scheduler)
+
+Epoch 1:   0%|          | 0/2 [00:00<?, ?batch/s]/Users/sheir/Documents/ChatGPT/revit_optim/revit/.venv/lib/python3.12/site-packages/torch/utils/data/dataloader.py:668: UserWarning: 'pin_memory' argument is set as true but no accelerator is found, then device pinned memory won't be used.
+  warnings.warn(warn_msg)
+
+Epoch 1: 100%|██████████| 2/2 [00:00<00:00, 23.10batch/s]
+Epoch 001 | train_loss=0.6968 | val_loss=0.6930 | top1=0.5000 | top5=1.0000
