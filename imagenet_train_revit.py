@@ -23,6 +23,7 @@ from group_space import get_gspace
 from model_config import MODEL_PRESETS
 
 from revit_windowed_gcsa import Rot2DTransformerV2, count_parameters
+from scripts.profile_scaling import estimate_revit
 
 
 class SoftTargetCrossEntropy(nn.Module):
@@ -344,6 +345,20 @@ def main():
 
     if is_main_process(rank):
         count_parameters(model)
+        flop_stats = estimate_revit(
+            {"dims": tuple(args.dims), "depths": tuple(args.depths), "heads": tuple(args.heads)},
+            group_order=gspace.fibergroup.order(),
+            image_size=args.image_size,
+            window_size=args.window_size,
+            kernel_size=args.qkv_kernel_size,
+            mlp_ratio=args.mlp_ratio,
+            stem_downsample=args.stem_downsample,
+            num_classes=args.num_classes,
+        )
+        print(
+            f"Estimated FLOPs (per-image forward, 2 FLOPs/MAC): "
+            f"{flop_stats['flops']:,} ({flop_stats['flops'] / 1e9:.3f} GFLOPs)"
+        )
         os.makedirs(args.output_dir, exist_ok=True)
         os.makedirs(os.path.join(args.output_dir, "checkpoints"), exist_ok=True)
         writer = SummaryWriter(log_dir=os.path.join(args.output_dir, "runs", f"imagenet_revit_{args.group_str}_{args.model_size}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"))
