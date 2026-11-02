@@ -154,6 +154,64 @@ Stage dimensions count **regular fields**: actual channels equal the field
 count times group order (D4 has order 8). Geometry and width changes can affect
 accuracy and equivariance; see the analysis below.
 
+Choose the ImageNet convolution family independently of `--model-size`:
+
+| `--model-config` | Regular-field operations | Group-order compute scaling |
+|---|---|---|
+| `quadratic` (default) | Original dense ESCNN convolutions | O(g²) |
+| `linear` | Tied spatial depthwise filters, shared field matrices, sparse right-group mixing | O(g), with fixed fields/depth/stencil size |
+| `fourier` | Tied spatial depthwise filters, full cyclic/dihedral group mixing via FFT | O(g log g), with fixed fields/depth |
+
+```bash
+python imagenet_train_revit.py --data-root /path/to/imagenet \
+  --model-config linear --model-size small --group-str D4 \
+  --qkv-kernel-size 3 --output-dir imagenet_linear_outputs
+
+python imagenet_train_revit.py --data-root /path/to/imagenet \
+  --model-config fourier --model-size small --group-str D4 \
+  --qkv-kernel-size 3 --output-dir imagenet_fourier_outputs
+```
+
+These choices replace every regular-to-regular convolution in the V2 stem,
+stages and downsamplers; the RGB lifting layer stays unchanged. Both structured
+families retain the same field types, heads, attention windows, normalization
+and classifier. They change learned capacity and need accuracy validation;
+checkpoints are not interchangeable between families. `--fused-qkv` applies
+only to `quadratic`; structured families execute native operators. Fourier FFTs
+run in FP32 under AMP, with outputs restored to the input feature dtype.
+
+The trainer's FLOP estimate follows the selected family. Fourier counts include
+complex arithmetic plus a separately reported FFT work estimate. Read the
+[research report](analysis/MODEL_CONFIGS_RESEARCH.md) for derivations, equivariance
+proofs, parameter counts, CPU timings and the accuracy/sampling limitations.
+
+The separate [equivariance research report](analysis/EQUIVARIANCE_RESEARCH.md)
+provides proofs and numerical checks for all three families, including feature
+maps, classifier logits, and gradients. Its 171 audit cases distinguish 126
+strict equivariance contracts from 45 tests that detect sampling, window,
+non-lattice rotation, or dropout limitations. The standard 224px/window-7 full
+models exhibit stride-phase errors; correct equivariant layers alone do not
+guarantee exact classifier invariance at that geometry.
+
+```bash
+python -m pytest tests/test_equivariance_configs.py -q
+python scripts/check_equivariance.py --output analysis/equivariance/results.json
+```
+
+```bash
+python scripts/profile_scaling.py --model-configs quadratic linear fourier \
+  --model-sizes tiny small --groups C4 C8 C16 D4 D8 D16 \
+  --image-sizes 224 448 --kernel-sizes 1 3 \
+  --output analysis/model_configs/complexity_results.json
+
+python scripts/compare_model_configs.py --groups C4 C8 D4 D8 \
+  --kernel-sizes 1 3 --output analysis/model_configs/runtime_results.json
+```
+
+The second command builds each model and measures synthetic CPU forward/backward
+latency by default. Add `--device cuda --dtype float16 --batch-size N` for a
+target-GPU comparison and CUDA peak memory. CPU timing is not a CUDA prediction.
+
 ### 3) ImageNet baseline — vanilla ViT-Small
 
 ```bash

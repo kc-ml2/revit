@@ -21,6 +21,7 @@ from torchvision import datasets, transforms
 from torchvision.transforms import v2 as T_v2
 from group_space import get_gspace
 from model_config import MODEL_PRESETS
+from group_complexity import MODEL_CONFIGS
 
 from revit_windowed_gcsa import Rot2DTransformerV2, count_parameters
 from scripts.profile_scaling import estimate_revit
@@ -80,6 +81,10 @@ def load_pretrained_weights(model: nn.Module, path: str, device: torch.device) -
     ckpt = torch.load(path, map_location="cpu", weights_only=False)
     if "model_state_dict" not in ckpt:
         raise KeyError(f"Checkpoint at {path} has no 'model_state_dict' key")
+    saved_config = ckpt.get("args", {}).get("model_config", "quadratic")
+    if saved_config != model.model_config:
+        raise ValueError(f"Checkpoint uses model-config={saved_config}; requested {model.model_config}. "
+                         "These architectures do not have interchangeable weights.")
     load_model_state(model, ckpt["model_state_dict"])
     return ckpt
 
@@ -188,6 +193,8 @@ def main():
     parser.add_argument("--num-classes", type=int, default=1000)
 
     parser.add_argument("--group-str", type=str, default='C4')
+    parser.add_argument("--model-config", choices=MODEL_CONFIGS, default="quadratic",
+                        help="Regular convolution family: existing quadratic, sparse linear, or Fourier")
     parser.add_argument(
         "--model-size",
         type=str,
@@ -300,13 +307,17 @@ def main():
         )
 
     gspace = get_gspace(args.group_str)
+    fused_qkv_effective = args.fused_qkv and args.model_config == "quadratic"
     if is_main_process(rank):
         order = gspace.fibergroup.order()
         print(f"Geometry: image={args.image_size}, stage_sides={stage_sides}, "
               f"fields={tuple(args.dims)}, channels={tuple(d * order for d in args.dims)}, "
               f"group_order={order}, window={args.window_size}, "
-              f"attention={args.attention_backend}, fused_qkv={args.fused_qkv}, "
+              f"model_config={args.model_config}, "
+              f"attention={args.attention_backend}, fused_qkv={fused_qkv_effective}, "
               f"amp_dtype={args.amp_dtype}, global_batch={args.batch_size * (world_size or 1)}")
+        if args.model_config != "quadratic":
+            print("Structured projections use native sparse/FFT operators; --fused-qkv applies only to quadratic.")
     model = Rot2DTransformerV2(
         gspace=gspace,
         in_channels=3,
@@ -323,12 +334,13 @@ def main():
         use_checkpoint=args.use_checkpoint,
         fast_init=args.fast_init,
         stem_downsample=args.stem_downsample,
+        model_config=args.model_config,
     ).to(device)
 
     for module in model.modules():
         if hasattr(module, "use_sdpa"):
             module.use_sdpa = args.attention_backend == "sdpa"
-            module.fused_qkv = args.fused_qkv
+            module.fused_qkv = fused_qkv_effective
 
     resume_ckpt = None
     if args.pretrained:
@@ -354,14 +366,20 @@ def main():
             mlp_ratio=args.mlp_ratio,
             stem_downsample=args.stem_downsample,
             num_classes=args.num_classes,
+            model_config=args.model_config,
+            group_kind="dihedral" if type(gspace.fibergroup).__name__ == "DihedralGroup" else "cyclic",
         )
         print(
-            f"Estimated FLOPs (per-image forward, 2 FLOPs/MAC): "
+            f"Estimated FLOPs (per-image forward, real MAC=2 FLOPs): "
             f"{flop_stats['flops']:,} ({flop_stats['flops'] / 1e9:.3f} GFLOPs)"
         )
+        if args.model_config == "fourier":
+            print(f"  Includes {flop_stats['fft_flops_estimate'] / 1e9:.6f} GFLOPs of estimated FFT work; "
+                  "Complex MAC=8 real FLOPs; FFT instruction counts depend on the backend. "
+                  "Basis expansion/norm/backward excluded.")
         os.makedirs(args.output_dir, exist_ok=True)
         os.makedirs(os.path.join(args.output_dir, "checkpoints"), exist_ok=True)
-        writer = SummaryWriter(log_dir=os.path.join(args.output_dir, "runs", f"imagenet_revit_{args.group_str}_{args.model_size}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"))
+        writer = SummaryWriter(log_dir=os.path.join(args.output_dir, "runs", f"imagenet_revit_{args.model_config}_{args.group_str}_{args.model_size}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"))
     else:
         writer = None
 
@@ -461,7 +479,7 @@ def main():
                 ckpt["model_state_dict"],
                 os.path.join(
                     args.output_dir,
-                    f"imagenet_revit_{args.group_str}_{args.model_size}_best_top1_{best_top1:.4f}_epoch_{best_epoch}.pth",
+                    f"imagenet_revit_{args.model_config}_{args.group_str}_{args.model_size}_best_top1_{best_top1:.4f}_epoch_{best_epoch}.pth",
                 ),
             )
             print(f"Best top1={best_top1:.4f} at epoch={best_epoch}")

@@ -8,6 +8,7 @@ import torch.nn.functional as F
 import torch.utils.checkpoint as checkpoint
 from escnn import gspaces
 from equivariant_ops import project_qkv, preserve_batchnorm_buffers
+from regular_group_ops import regular_conv
 from escnn.nn import (
     FieldType,
     GeometricTensor,
@@ -45,7 +46,7 @@ class DropPath(nn.Module):
 
 
 class Rot2DStem(nn.Module):
-    def __init__(self, gspace, in_channels: int, out_type: FieldType, downsample: int = 4, initialize: bool = True):
+    def __init__(self, gspace, in_channels: int, out_type: FieldType, downsample: int = 4, initialize: bool = True, conv_mode: str = "quadratic"):
         super().__init__()
         if downsample not in (2, 4, 8):
             raise ValueError(f"downsample must be 2, 4, or 8, got {downsample}")
@@ -64,8 +65,11 @@ class Rot2DStem(nn.Module):
             else:
                 in_t, k, pad = mid_type, 3, 1
             out_t = out_type if i == n_layers - 1 else mid_type
+            conv = (R2Conv(in_t, out_t, kernel_size=k, stride=2, padding=pad,
+                           bias=False, initialize=initialize) if i == 0 else
+                    regular_conv(in_t, out_t, k, stride=2, initialize=initialize, mode=conv_mode))
             layers.extend([
-                R2Conv(in_t, out_t, kernel_size=k, stride=2, padding=pad, bias=False, initialize=initialize),
+                conv,
                 InnerBatchNorm(out_t),
                 ReLU(out_t),
             ])
@@ -76,9 +80,9 @@ class Rot2DStem(nn.Module):
 
 
 class Rot2DDownsample(nn.Module):
-    def __init__(self, in_type: FieldType, out_type: FieldType, initialize: bool = True):
+    def __init__(self, in_type: FieldType, out_type: FieldType, initialize: bool = True, conv_mode: str = "quadratic"):
         super().__init__()
-        self.conv = R2Conv(in_type, out_type, kernel_size=3, stride=2, padding=1, bias=False, initialize=initialize)
+        self.conv = regular_conv(in_type, out_type, 3, stride=2, initialize=initialize, mode=conv_mode)
         self.bn = InnerBatchNorm(out_type)
         self.act = ReLU(out_type)
 
@@ -96,6 +100,7 @@ class Rot2DWindowAttention(nn.Module):
         attn_dropout: float = 0.0,
         proj_dropout: float = 0.0,
         initialize: bool = True,
+        conv_mode: str = "quadratic",
     ):
         super().__init__()
         if num_heads <= 0 or len(in_type.representations) % num_heads:
@@ -106,6 +111,7 @@ class Rot2DWindowAttention(nn.Module):
             raise ValueError("Attention heads require complete regular fields")
 
         self.in_type = in_type
+        self.conv_mode = conv_mode
         self.num_heads = num_heads
         self.window_size = window_size
         self.head_size = len(in_type.representations) // num_heads
@@ -114,13 +120,12 @@ class Rot2DWindowAttention(nn.Module):
         # here — 7x7 windows are too small for fused kernels to win — so bmm stays
         # the default. Global attention (revit_gcsa.py) defaults to SDPA instead.
         self.use_sdpa = False
-        self.fused_qkv = True
+        self.fused_qkv = conv_mode == "quadratic"
 
-        pad = (qkv_kernel_size - 1) // 2
-        self.to_q = R2Conv(in_type, in_type, qkv_kernel_size, padding=pad, bias=False, initialize=initialize)
-        self.to_k = R2Conv(in_type, in_type, qkv_kernel_size, padding=pad, bias=False, initialize=initialize)
-        self.to_v = R2Conv(in_type, in_type, qkv_kernel_size, padding=pad, bias=False, initialize=initialize)
-        self.to_out = R2Conv(in_type, in_type, 1, bias=False, initialize=initialize)
+        self.to_q = regular_conv(in_type, in_type, qkv_kernel_size, initialize=initialize, mode=conv_mode)
+        self.to_k = regular_conv(in_type, in_type, qkv_kernel_size, initialize=initialize, mode=conv_mode)
+        self.to_v = regular_conv(in_type, in_type, qkv_kernel_size, initialize=initialize, mode=conv_mode)
+        self.to_out = regular_conv(in_type, in_type, initialize=initialize, mode=conv_mode)
 
         self.attn_dropout = nn.Dropout(attn_dropout)
         self.proj_dropout = PointwiseDropout(in_type, p=proj_dropout)
@@ -148,7 +153,12 @@ class Rot2DWindowAttention(nn.Module):
         return x[:, :, :h, :w]
 
     def forward(self, x: GeometricTensor) -> GeometricTensor:
-        qkv = project_qkv(x, self.to_q, self.to_k, self.to_v, self.fused_qkv, packed=True)
+        if self.conv_mode == "quadratic":
+            qkv = project_qkv(x, self.to_q, self.to_k, self.to_v, self.fused_qkv, packed=True)
+        else:
+            # Structured operators do not expand dense QKV kernels. Each uses
+            # its native sparse/FFT path, then shares the window packing below.
+            qkv = torch.cat([layer(x).tensor for layer in (self.to_q, self.to_k, self.to_v)], dim=1)
         # Partition once while projections share a tensor. Head boundaries still
         # contain complete regular fields, independently for Q, K and V.
         windows, meta = self._window_partition(qkv)
@@ -178,15 +188,15 @@ class Rot2DWindowAttention(nn.Module):
 
 
 class Rot2DMLP(nn.Module):
-    def __init__(self, in_type: FieldType, hidden_mult: int = 4, dropout: float = 0.0, initialize: bool = True):
+    def __init__(self, in_type: FieldType, hidden_mult: int = 4, dropout: float = 0.0, initialize: bool = True, conv_mode: str = "quadratic"):
         super().__init__()
         hidden_type = FieldType(in_type.gspace, hidden_mult * in_type.representations)
         self.net = nn.Sequential(
-            R2Conv(in_type, hidden_type, 1, bias=False, initialize=initialize),
+            regular_conv(in_type, hidden_type, initialize=initialize, mode=conv_mode),
             InnerBatchNorm(hidden_type),
             ReLU(hidden_type),
             PointwiseDropout(hidden_type, p=dropout),
-            R2Conv(hidden_type, in_type, 1, bias=False, initialize=initialize),
+            regular_conv(hidden_type, in_type, initialize=initialize, mode=conv_mode),
             InnerBatchNorm(in_type),
             PointwiseDropout(in_type, p=dropout),
         )
@@ -208,6 +218,7 @@ class Rot2DBlockV2(nn.Module):
         qkv_kernel_size: int,
         use_checkpoint: bool,
         initialize: bool = True,
+        conv_mode: str = "quadratic",
     ):
         super().__init__()
         self.norm1 = InnerBatchNorm(in_type)
@@ -220,8 +231,9 @@ class Rot2DBlockV2(nn.Module):
             attn_dropout=attn_dropout,
             proj_dropout=dropout,
             initialize=initialize,
+            conv_mode=conv_mode,
         )
-        self.mlp = Rot2DMLP(in_type, hidden_mult=mlp_ratio, dropout=dropout, initialize=initialize)
+        self.mlp = Rot2DMLP(in_type, hidden_mult=mlp_ratio, dropout=dropout, initialize=initialize, conv_mode=conv_mode)
         self.drop_path1 = DropPath(drop_path)
         self.drop_path2 = DropPath(drop_path)
         self.alpha1 = nn.Parameter(torch.ones(1))
@@ -308,6 +320,7 @@ class Rot2DTransformerV2(nn.Module):
         use_checkpoint: bool = False,
         fast_init: bool = False,
         stem_downsample: int = 4,
+        model_config: str = "quadratic",
     ):
         super().__init__()
         if not (len(dims) == len(depths) == len(heads) == 4):
@@ -316,11 +329,14 @@ class Rot2DTransformerV2(nn.Module):
             raise ValueError("Positive stage dimensions and depths required; heads must divide dims")
         if mlp_ratio <= 0 or not 0 <= drop_path_rate < 1:
             raise ValueError("mlp_ratio must be positive and drop_path_rate in [0, 1)")
+        if model_config not in ("quadratic", "linear", "fourier"):
+            raise ValueError("model_config must be quadratic, linear, or fourier")
+        self.model_config = model_config
         self.gspace = gspace
         self.fast_init = fast_init
 
         stage_types = [FieldType(gspace, d * [gspace.regular_repr]) for d in dims]
-        self.stem = Rot2DStem(gspace, in_channels, stage_types[0], downsample=stem_downsample, initialize=False)
+        self.stem = Rot2DStem(gspace, in_channels, stage_types[0], downsample=stem_downsample, initialize=False, conv_mode=model_config)
 
         total_blocks = sum(depths)
         dpr = torch.linspace(0, drop_path_rate, total_blocks).tolist()
@@ -342,11 +358,12 @@ class Rot2DTransformerV2(nn.Module):
                         qkv_kernel_size=qkv_kernel_size,
                         use_checkpoint=use_checkpoint,
                         initialize=False,
+                        conv_mode=model_config,
                     )
                 )
                 dpr_idx += 1
 
-            downsample = Rot2DDownsample(stage_types[i], stage_types[i + 1], initialize=False) if i < (len(dims) - 1) else None
+            downsample = Rot2DDownsample(stage_types[i], stage_types[i + 1], initialize=False, conv_mode=model_config) if i < (len(dims) - 1) else None
             stages.append(Rot2DStage(nn.ModuleList(blocks), downsample))
 
         self.stages = nn.ModuleList(stages)
