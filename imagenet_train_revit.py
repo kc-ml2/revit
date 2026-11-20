@@ -15,6 +15,8 @@ from torch.utils.tensorboard import SummaryWriter
 from torchvision import datasets, transforms
 from torchvision.transforms import v2 as T_v2
 from tqdm import tqdm
+from budget_cli import add_budget_arguments, budget_config, model_config, smooth_targets
+from budget_revit import BudgetAdaptiveREViT
 from group_space import get_gspace
 
 from revit_windowed_gcsa import Rot2DTransformerV2, count_parameters
@@ -107,6 +109,7 @@ def save_training_checkpoint(path, model, optimizer, scheduler, epoch, top1, dev
     if device.type == "cuda":
         torch.cuda.synchronize()
     payload = {
+        **model_config(model),
         "epoch": epoch,
         "top1": top1,
         "model_state_dict": _to_cpu(model.state_dict()),
@@ -125,6 +128,15 @@ def load_pretrained_weights(model: nn.Module, path: str, device: torch.device) -
         raise KeyError(f"Checkpoint at {path} has no 'model_state_dict' key")
     model.load_state_dict(_strip_module_prefix(ckpt["model_state_dict"]))
     return ckpt
+
+
+def imagenet_validation_transform():
+    return transforms.Compose([
+        transforms.Resize(256),
+        transforms.CenterCrop(224),
+        transforms.ToTensor(),
+        transforms.Normalize(mean=(0.485, 0.456, 0.406), std=(0.229, 0.224, 0.225)),
+    ])
 
 
 def get_imagenet_loaders(
@@ -157,17 +169,8 @@ def get_imagenet_loaders(
         train_list.append(transforms.RandomErasing(p=random_erase, value="random"))
     train_tfms = transforms.Compose(train_list)
 
-    val_tfms = transforms.Compose(
-        [
-            transforms.Resize(256),
-            transforms.CenterCrop(224),
-            transforms.ToTensor(),
-            normalize,
-        ]
-    )
-
     train_ds = datasets.ImageFolder(train_dir, transform=train_tfms)
-    val_ds = datasets.ImageFolder(val_dir, transform=val_tfms)
+    val_ds = datasets.ImageFolder(val_dir, transform=imagenet_validation_transform())
 
     train_sampler = DistributedSampler(train_ds, shuffle=True) if use_ddp else None
     val_sampler = DistributedSampler(val_ds, shuffle=False) if use_ddp else None
@@ -205,6 +208,8 @@ def train_one_epoch(
     label_smoothing=0.1,
     mixup_fn=None,
     mixup_prob=1.0,
+    adaptive=False,
+    num_classes=1000,
 ):
     model.train()
     hard_criterion = nn.CrossEntropyLoss(label_smoothing=label_smoothing)
@@ -223,8 +228,13 @@ def train_one_epoch(
 
         optimizer.zero_grad(set_to_none=True)
         with torch.autocast(device_type="cuda" if device.type == "cuda" else "cpu", dtype=torch.float16, enabled=device.type == "cuda"):
-            out = model(x)
-            loss = soft_criterion(out, y) if soft else hard_criterion(out, y)
+            if adaptive:
+                targets = y if soft else smooth_targets(y, num_classes, label_smoothing)
+                _, image_losses = model(x, targets=targets)
+                loss = image_losses.mean()
+            else:
+                out = model(x)
+                loss = soft_criterion(out, y) if soft else hard_criterion(out, y)
 
         scaler.scale(loss).backward()
         scaler.unscale_(optimizer)
@@ -246,7 +256,7 @@ def train_one_epoch(
 
 
 @torch.no_grad()
-def evaluate(model, loader, device, rank):
+def evaluate(model, loader, device, rank, budget=None):
     model.eval()
     criterion = nn.CrossEntropyLoss()
     total_loss = 0.0
@@ -259,14 +269,14 @@ def evaluate(model, loader, device, rank):
         y = y.to(device, non_blocking=True)
 
         with torch.autocast(device_type="cuda" if device.type == "cuda" else "cpu", dtype=torch.float16, enabled=device.type == "cuda"):
-            out = model(x)
+            out = model(x) if budget is None else model(x, budget=budget)
             loss = criterion(out, y)
 
         bs = y.size(0)
         total_loss += loss.item() * bs
         total += bs
 
-        _, pred = out.topk(5, dim=1, largest=True, sorted=True)
+        _, pred = out.topk(min(5, out.shape[1]), dim=1, largest=True, sorted=True)
         correct = pred.eq(y.view(-1, 1))
         top1 += correct[:, :1].sum().item()
         top5 += correct.sum().item()
@@ -325,11 +335,13 @@ def main():
     parser.add_argument("--mlp-ratio", type=int, default=4)
     parser.add_argument("--dropout", type=float, default=0.0)
     parser.add_argument("--attn-dropout", type=float, default=0.0)
-    parser.add_argument("--drop-path-rate", type=float, default=0.1)
+    parser.add_argument("--drop-path-rate", type=float, default=None)
     parser.add_argument("--qkv-kernel-size", type=int, default=1)
     parser.add_argument("--use-checkpoint", action="store_true")
     parser.add_argument("--fast-init", action="store_true", help="Use faster non-basis-aware init for R2Conv")
 
+    parser.add_argument("--stem-downsample", type=int, default=4)
+    add_budget_arguments(parser)
     parser.add_argument("--ddp", action="store_true", help="Use DDP (launch via torchrun)")
     parser.add_argument("--data-parallel", action="store_true", help="Use DataParallel when not using DDP")
 
@@ -353,6 +365,11 @@ def main():
     args = parser.parse_args()
     if args.pretrained and not args.pretrained_path:
         parser.error("--pretrained-path is required when --pretrained is set")
+    adaptive = args.budget_profiles is not None
+    if adaptive and any((args.dropout, args.attn_dropout, args.drop_path_rate, args.use_checkpoint)):
+        parser.error("The budget backbone uses deterministic blocks and does not implement legacy dropout or --use-checkpoint")
+    if not 0 <= args.budget <= 1:
+        parser.error("--budget must lie in [0, 1]")
     seed_everything(args.seed)
 
     # ViT-tiny-like default capacity (unless explicitly overridden)
@@ -408,24 +425,31 @@ def main():
             f"mixup_prob={args.mixup_prob}, switch_prob={args.mixup_switch_prob}"
         )
 
-    # gspace = gspaces.rot2dOnR2(N=args.group_n)
-    gspace = get_gspace(args.group_str)
-    model = Rot2DTransformerV2(
-        gspace=gspace,
-        in_channels=3,
-        num_classes=args.num_classes,
-        dims=tuple(args.dims),
-        depths=tuple(args.depths),
-        heads=tuple(args.heads),
-        window_size=args.window_size,
-        mlp_ratio=args.mlp_ratio,
-        dropout=args.dropout,
-        attn_dropout=args.attn_dropout,
-        drop_path_rate=args.drop_path_rate,
-        qkv_kernel_size=args.qkv_kernel_size,
-        use_checkpoint=args.use_checkpoint,
-        fast_init=args.fast_init,
-    ).to(device)
+    if adaptive:
+        model = BudgetAdaptiveREViT(budget_config(
+            args, in_channels=3, num_classes=args.num_classes, image_size=224,
+            depths=tuple(args.depths), heads=tuple(args.heads), window_size=args.window_size,
+            mlp_ratio=args.mlp_ratio, qkv_kernel=args.qkv_kernel_size, stem_downsample=args.stem_downsample,
+        ))
+    else:
+        model = Rot2DTransformerV2(
+            gspace=get_gspace(args.group_str),
+            in_channels=3,
+            num_classes=args.num_classes,
+            dims=tuple(args.dims),
+            depths=tuple(args.depths),
+            heads=tuple(args.heads),
+            window_size=args.window_size,
+            mlp_ratio=args.mlp_ratio,
+            dropout=args.dropout,
+            attn_dropout=args.attn_dropout,
+            drop_path_rate=0.1 if args.drop_path_rate is None else args.drop_path_rate,
+            qkv_kernel_size=args.qkv_kernel_size,
+            use_checkpoint=args.use_checkpoint,
+            fast_init=args.fast_init,
+            stem_downsample=args.stem_downsample,
+        )
+    model.to(device)
 
     resume_ckpt = None
     if args.pretrained:
@@ -456,7 +480,7 @@ def main():
     scaler = torch.amp.GradScaler("cuda" if device.type == "cuda" else "cpu", enabled=device.type == "cuda")
 
     start_epoch = 0
-    best_top1 = 0.0
+    best_top1 = -1.0
     best_epoch = -1
     if (
         args.pretrained
@@ -499,10 +523,13 @@ def main():
             label_smoothing=args.label_smoothing,
             mixup_fn=mixup_fn,
             mixup_prob=args.mixup_prob,
+            adaptive=adaptive,
+            num_classes=args.num_classes,
         )
         scheduler.step()
 
-        val_loss, top1, top5 = evaluate(model, val_loader, device, rank if use_ddp else None)
+        val_loss, top1, top5 = evaluate(model, val_loader, device, rank if use_ddp else None,
+                                        budget=args.budget if adaptive else None)
 
         if is_main_process(rank):
             writer.add_scalar("train/loss", train_loss, epoch)
@@ -534,7 +561,7 @@ def main():
         if best_ckpt_path is not None:
             ckpt = torch.load(best_ckpt_path, map_location="cpu", weights_only=False)
             torch.save(
-                ckpt["model_state_dict"],
+                {key: ckpt[key] for key in ('budget_config', 'model_state_dict')} if adaptive else ckpt["model_state_dict"],
                 os.path.join(
                     args.output_dir,
                     f"imagenet_revit_{args.group_str}_{args.model_size}_best_top1_{best_top1:.4f}_epoch_{best_epoch}.pth",
