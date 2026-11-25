@@ -1,8 +1,24 @@
-# Budget Adaptive REViT Technical Report
+# REViT Symmetry and Width Profiles Technical Report
 
-Budget-adaptive REViT gives an image one width profile while keeping the same finite group throughout the network. The implementation supports the quarter-turn group (C_4) and the square's rotation-reflection group (D_4). It uses one shared lift, one decision per image, nested steerable coefficients, and physically narrower computation for smaller profiles.
+The repository supports two training modes. The symmetry supernet trains one shared D4 backbone and exports static subgroup-and-width profiles. Budget-adaptive REViT chooses width per image under a compute cap while retaining a fixed configured group. They share the same square-grid transformer blocks and geometry.
 
-## Model and execution
+## Train-once symmetry and width supernet
+
+`SymmetrySupernet` builds one bank of D4 steerable convolution coefficients, one set of residual scales, and one classifier. Its training profiles specify a subgroup and stage widths in regular fields. The full-width D4 profile defines the upper stage widths. A stage width must fit inside those bounds and divide into whole fields per attention head. An optional leading field count sets the profile's stem width. Stage-only profiles use the common default stem width. The lift emits the selected stem width multiplied by the subgroup order, using the corresponding prefix of the shared lifting coefficients.
+
+For each selected subgroup H, the left action of H on the eight D4 orientation channels partitions them into complete H-regular orbits. The implementation retains the orbit of the identity, ordered to match ESCNN's standalone regular representation. It crops the fixed sampled basis for a single field pair along the input and output orientation axes. It also slices the learned coefficient tensor along the field axes. The active basis expands only those field pairs and orientation coordinates. Lifting kernels restrict their output axis because their inputs are trivial fields. At two input and two output fields, the dense D4 convolution has 16 input and 16 output channels. The C4 crop has eight channels on each axis. Centered downsampling, symmetric windows, and normalization tied over orientations preserve the selected subgroup action.
+
+At every optimizer step, all examples and DDP ranks use the same profile. The largest D4 path takes even-numbered steps, and the other paths cycle through odd-numbered steps. This keeps activation storage to one profile. The parts of a shared tensor outside the active crop receive zero loss gradient on that step. Each profile has separate BatchNorm affine parameters and running moments, including at the lift. Validation runs every profile on the same split, and best checkpoints use the mean top-1 across profiles. In evaluation, the supernet keeps one expanded filter per layer and replaces it when the profile changes.
+
+`export_profile` folds the crop into an ordinary static `BudgetAdaptiveREViT` singleton. The exporter expresses each cropped basis block in the selected group's native sampled basis by a least-squares change of coefficients, checks that the reconstruction spans the cropped basis, and copies the profile-specific normalization, residual scales, and classifier prefix. The resulting checkpoint keeps native group coefficients for fine-tuning. `crop_d4_profile` uses the same conversion on a width-only D4 checkpoint to create the cold-crop baseline. Its normalization moments are inherited from the source width, so document calibration or fine-tuning when comparing it with jointly trained exports. The two legacy labels `D2` and `Z2` continue to mean single-reflection `Cs` and trivial `C1`. Use `D2_4` for half-turn plus two mirrors.
+
+## ImageNet training and tests
+
+The first proof of concept used the actual Tiny preset with full D4 widths `12,24,48,96`, depths `1,2,3,1`, heads `1,2,4,8`, 224-pixel crops, and a 1,000-class output. A generated ImageFolder fixture supplied 24 training and six validation images. A single CPU epoch completed 12 optimizer steps. All six default profiles received updates, with six batches at the reference profile and the remainder spread across the smaller and subgroup profiles. All six exported checkpoints reproduced their supernet path within a maximum absolute logit error of `2.09e-7` in the FP32 export check. A second fixture run fine-tuned the small C4 export through the ImageNet trainer. The cold-crop command also produced an evaluable C4 model from a separately trained D4 singleton. ImageNet-1K accuracy, CUDA performance, and Large-scale training remain open.
+
+For the ImageNet-1K study, run Tiny first on the actual train and validation sets. Compare jointly trained exports, cold crops of a D4-only model, and independently trained static profiles with the same group, width, geometry, and resolutions. Measure accuracy before and after a common fine-tuning allowance. Record total supernet training cost, memory, per-profile sample counts, and the full D4 accuracy gap. Report batch-one latency and batched throughput for the native exported models. Compare C4 with D2_4 at matched widths to examine symmetry choice at the same scalar channel count. Scale to the Large preset after measuring full-width D4 memory on the intended accelerator. The [README](../README.md#train-once-and-export-symmetry-and-width-profiles) gives both launch commands. [Once-for-All](https://arxiv.org/abs/1908.09791), [Slimmable Neural Networks](https://arxiv.org/abs/1812.08928)
+
+## Fixed-symmetry adaptive model and execution
 
 1. `BudgetAdaptiveREViT._stem` centers the sampling grid, lifts the image to a small set of regular fields using a steerable convolution, and applies normalization and ReLU. The stem width is common to every execution path.
 2. The controller computes the spatial and orientation mean and maximum of each stem field. A two-layer MLP consumes these statistics and the requested budget. An eligibility mask sets scores above the cap to negative infinity. Argmax breaks exact ties in favor of the lowest profile index.
@@ -14,11 +30,9 @@ A profile (p) specifies a vector of stage widths (w_{p,s}). A convolution owns a
 
 In no-grad eval mode, kernels are expanded lazily at parameter precision and cached per profile. Training, a device or dtype change, and loading a checkpoint clear the cache. Checkpoints store learned coefficients and normalization state. `export_profile(i)` copies the selected prefixes and normalization modules into a standalone model without a controller. A matching singleton model can also be trained independently. The exported checkpoint includes its configuration and can initialize a singleton fine-tuning run. `export --widths` also crops a separately trained wide profile to new field prefixes, including the inherited normalization moments. Recalibrate those moments during fine-tuning before comparing the resulting pruned baseline.
 
-## Equivariance on the image grid
+## Fixed-symmetry equivariance on the image grid
 
-Let (T_g) act on the image and (
-ho_g) act on regular feature fields. The shared lifting features satisfy (S(T_g x)=
-ho_g S(x)). Each regular field is permuted along its orientation axis, and square-grid (C_4) and (D_4) actions permute spatial locations. Mean and max over both axes give a descriptor unchanged by these permutations. For a fixed budget (c), the controller therefore selects (b(T_g x,c)=b(x,c)).
+Let $T_g$ act on the image and $\rho_g$ act on regular feature fields. The shared lifting features satisfy $S(T_g x)=\rho_g S(x)$. Each regular field is permuted along its orientation axis, and square-grid (C_4) and (D_4) actions permute spatial locations. Mean and max over both axes give a descriptor unchanged by these permutations. For a fixed budget (c), the controller therefore selects (b(T_g x,c)=b(x,c)).
 
 Each profile contains only complete regular fields. Steering is applied to each input-output field pair, so restricting the set of pairs preserves the linear intertwiner constraint. Attention heads contain an integer number of regular fields. Their group action is orthogonal, preserving the Q/K inner product. The spatial group action jointly permutes queries and keys in global attention. For window attention, it permutes whole windows and locations inside each window. Each profile's nonlinearities, normalization, and residual additions commute with these same permutations in eval mode. With the invariant route, the selected feature path is equivariant and the pooled classifier logits are invariant.
 
@@ -26,7 +40,7 @@ Two grid details matter. Fixed-origin strided convolution can miss the rotated c
 
 The argument applies to exact square-grid actions in real arithmetic. Floating-point accumulation order can change scores near an argmax tie. Test routing agreement and logit error at the deployed precision, including examples with small eligible-score margins. `Z2` maps to the trivial ESCNN group in this repository and explicit C4/D4 guarantees apply to those corresponding configured models. The adaptive paths accept square inputs and preserve C4/D4 geometry at odd and even side lengths.
 
-## Budget and training objective
+## Fixed-symmetry budget and training objective
 
 Given positive increasing costs (C_i), profile (i) is feasible for normalized budget (c \in [0,1]) when \((C_i-C_0)/(C_{P-1}-C_0) \le c\). The default estimates dense post-stem MACs for the configured image size. It counts the active convolutions, QK and AV products including padded tokens, and the classifier. It excludes the shared stem, routing, normalization, memory traffic, allocation overhead and compiler effects. `--profile-costs` can supply an increasing calibrated vector, such as fixed-profile median milliseconds for one device, precision, and batch setting. Budget is a ceiling in the supplied cost units and the selected cost can vary within that ceiling.
 
@@ -36,25 +50,28 @@ Training samples a budget threshold independently for each image. Each profile s
 
 | Location | Responsibility |
 | --- | --- |
+| `symmetry_supernet.py` | D4 coefficient sharing, subgroup basis crops, profile schedule, and native export. |
 | `budget_revit.py` | Regular-field profile operators, centered grid, router, MAC estimate, training loss, and export. |
 | `budget_cli.py` | CLI arguments, adaptive config metadata, target smoothing, checkpoint reconstitution. |
-| `group_space.py` | Maps legacy group names to ESCNN gspaces. |
+| `group_space.py` | ESCNN spaces, square-grid actions, and checkpoint-compatible group aliases. |
 | `revit_gcsa.py` | Original global lifting, Q/K/V attention, MLP, invariant head, and SDPA helper reused by the adaptive model. |
 | `revit_windowed_gcsa.py` | Original hierarchical windowed backbone, stem, stage transitions, and classifier. |
 | `train_revit.py` | Small-data entry point, held-out development split, logging and checkpoints. |
-| `imagenet_train_revit.py` | ImageNet transforms, legacy and adaptive training, AMP, distributed training and checkpoint resume. |
+| `imagenet_train_revit.py` | ImageNet transforms, symmetry-supernet, legacy and budget-adaptive training, AMP, DDP and checkpoint resume. |
 | `imagenet_train_vit.py` | Static torchvision ViT-Small ImageNet reference. |
 | `datasets/cifar10.py`, `datasets/rot_mnist.py`, `datasets/pcam.py` | Data layout, transforms, and train/evaluation loaders. PCam expects `PCam/train`, `PCam/valid`, and `PCam/test` in ImageFolder format for the corresponding splits. |
 | `utils.py` | Reusable rotation augmentation and early-stopping utilities. |
+| `scripts/run_supernet.py` | Profile inspection, trained export and cold-crop control. |
 | `scripts/run_budget.py` | Adaptive evaluator, fixed export, timed deployment runs and profiler traces. |
 | `scripts/benchmark_sdpa.py` | Standalone comparison of attention kernels on the original backbones. |
 | `scripts/cleanup_checkpoints.py` | Checkpoint retention utility. |
+| `tests/test_symmetry_supernet.py` | Subgroup invariance, shared gradient, schedule, and checkpoint tests. |
 | `tests/test_budget_revit.py` | CPU regression checks for group actions, nesting and training/export. |
 | `requirements.txt`, `requirements-lock.txt` | Core dependencies and the pinned environment used by the original project. |
 | `analysis/EQUIVARIANCE_RESEARCH.md`, `analysis/MODEL_CONFIGS_RESEARCH.md` | Existing architecture and symmetry notes. |
 | `analysis/budget_revit_paper.tex` | Editable paper draft and experiment templates. |
 
-## Experiment design
+## Fixed-symmetry adaptive experiments
 
 Develop on CIFAR-10 with a seeded held-out subset of the training data. Use ImageNet and a PCam test split to test transfer of the result across tasks. Keep width-search effort, pretraining, augmentations, precision, hardware and evaluation splits aligned. Check one global and one hierarchical model. Compare independently trained singleton widths, a pruned exported prefix with matched fine-tuning, the learned route, and the trivial-group dynamic control. A supernet export controls for the effect of routing at a given trained width. Pruning an independently trained wide model with `export --widths` provides a separate compression baseline. Independently trained small singletons control for multi-width training. C4 experiments can use `--pointwise-backend fourier` to check the same weights through an unfused PyTorch FFT reference for regular-to-regular 1×1 projections. That path extracts the first column of each circulant block and caches its Fourier transform. Benchmark the official fused Flash EQ-Linear CUDA kernels separately on compatible hardware. The cyclic construction requires a separate design for D4. [Flash EQ-Linear](https://arxiv.org/html/2607.21271v2)
 
@@ -64,7 +81,7 @@ Benchmark real evaluation batches as well as synthetic inputs. Use `--dataset` w
 
 Use exact quarter-turn and reflection shifts with `--orientation` and inspect every in-group action with `--check-group`. These tests distinguish numerical symmetry from generalization to orientation shifts outside the group. Use fixed angles, interpolation settings and independent validation when evaluating out-of-group transformations.
 
-## Verification and remaining work
+## Fixed-symmetry adaptive verification
 
 Local CPU checks cover every C4/D4 element on the global and windowed backbones, odd and even shapes, mixed budget dispatch, ESCNN kernel agreement, physical narrowing, router and width gradients, normalization updates, and fixed export/reload. Both classification entry points completed a short synthetic ImageFolder run. The benchmark, evaluator and export workflows ran on synthetic data. The CPU smoke checks also exercised compiled post-stem dispatch and checked the C4 Fourier pointwise reference against the dense output. Full dataset training, CUDA and distributed performance, and the fused Flash EQ-Linear comparison remain open. The paper marks the corresponding results and analysis for later completion.
 

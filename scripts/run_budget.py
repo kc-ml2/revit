@@ -13,6 +13,7 @@ import torch
 
 from budget_cli import load_budget_model, model_config
 from budget_revit import BudgetAdaptiveREViT, BudgetREViTConfig, ProfileConv, ProfileNorm
+from group_space import SQUARE_GROUPS, grid_actions
 
 
 def autocast(device, precision):
@@ -108,7 +109,7 @@ def benchmark(args):
         if args.dataset is None:
             inputs = [torch.randn(batch, channels, size, size, generator=input_rng)]
         else:
-            batches = validation_loader(args, device, batch_size=batch)
+            batches = validation_loader(args, device, batch_size=batch, image_size=size)
             full = (images for images, _ in batches if len(images) == batch)
             inputs = [orient(images, args.orientation, input_rng) for images in islice(full, args.input_batches)]
             if not inputs:
@@ -173,7 +174,7 @@ def benchmark(args):
     }
 
 
-def validation_loader(args, device, batch_size=None):
+def validation_loader(args, device, batch_size=None, image_size=224):
     from torch.utils.data import DataLoader
 
     benchmark_batches = batch_size is not None
@@ -182,7 +183,7 @@ def validation_loader(args, device, batch_size=None):
         from torchvision.datasets import ImageFolder
         from imagenet_train_revit import imagenet_validation_transform
 
-        dataset = ImageFolder(args.data_root / 'val', transform=imagenet_validation_transform())
+        dataset = ImageFolder(args.data_root / 'val', transform=imagenet_validation_transform(image_size))
     elif args.dataset == 'pcam':
         from datasets import get_pcam_loaders
 
@@ -244,8 +245,8 @@ def evaluate(args):
                     rescue_increments=[], transforms={}) for budget in budgets]
     pcam_targets = []
     pcam_scores = [[] for _ in budgets]
-    order = {'C4': 4, 'D4': 8, 'Z2': 1}[model.config.group]
-    for step, (images, targets) in enumerate(validation_loader(args, device)):
+    transforms = grid_actions(model.config.group)[1:]
+    for step, (images, targets) in enumerate(validation_loader(args, device, image_size=model.config.image_size)):
         if args.max_batches is not None and step >= args.max_batches:
             break
         images = orient(images.to(device), args.orientation, orientation_rng)
@@ -289,7 +290,7 @@ def evaluate(args):
                         'above_1e-2': (margin >= 1e-2) & margin.isfinite(),
                         'single_eligible': margin.isinf(),
                     }
-                    for g in range(1, order):
+                    for g in transforms:
                         transformed, transformed_routes = model(action(images, g), budget=budget, return_routes=True)
                         current = record['transforms'].setdefault(g, dict(route_matches=0, max_logit_error=0.0,
                                                                           by_margin={}))
@@ -364,7 +365,7 @@ def main():
         command.add_argument('--orientation', choices=('identity', 'rotate', 'reflect', 'uniform-c4', 'uniform-d4'), default='identity')
     bench.add_argument('--checkpoint', type=Path)
     bench.add_argument('--smoke-backbone', choices=('global', 'windowed'), default='windowed')
-    bench.add_argument('--group', choices=('C4', 'D4', 'Z2'), default='C4')
+    bench.add_argument('--group', choices=SQUARE_GROUPS, default='C4')
     bench.add_argument('--batch-sizes', type=int, nargs='+', default=(1, 16))
     bench.add_argument('--warmup', type=int, default=5)
     bench.add_argument('--iterations', type=int, default=30)

@@ -7,6 +7,7 @@ from torch import nn
 from torch.nn import functional as F
 
 from budget_revit import BudgetAdaptiveREViT, BudgetREViTConfig, parse_profiles
+from symmetry_supernet import SymmetrySupernet, SymmetrySupernetConfig
 
 
 def add_budget_arguments(parser):
@@ -31,6 +32,8 @@ def budget_config(args, **backbone):
 def model_config(model):
     if isinstance(model, (nn.DataParallel, nn.parallel.DistributedDataParallel)):
         model = model.module
+    if isinstance(model, SymmetrySupernet):
+        return {'symmetry_supernet_config': asdict(model.supernet_config)}
     if isinstance(model, BudgetAdaptiveREViT):
         return {'budget_config': asdict(model.config)}
     return {}
@@ -41,6 +44,19 @@ def load_budget_model(path, device='cpu'):
     if 'budget_config' not in checkpoint or 'model_state_dict' not in checkpoint:
         raise ValueError('Expected an adaptive training checkpoint or exported profile')
     model = BudgetAdaptiveREViT(BudgetREViTConfig(**checkpoint['budget_config']))
+    return _load_weights(model, checkpoint, device)
+
+
+def load_supernet_model(path, device='cpu'):
+    checkpoint = torch.load(path, map_location='cpu', weights_only=True)
+    if 'symmetry_supernet_config' not in checkpoint or 'model_state_dict' not in checkpoint:
+        raise ValueError('Expected a symmetry supernet training checkpoint')
+    config = checkpoint['symmetry_supernet_config']
+    model = SymmetrySupernet(SymmetrySupernetConfig(BudgetREViTConfig(**config['backbone']), config['profiles']))
+    return _load_weights(model, checkpoint, device)
+
+
+def _load_weights(model, checkpoint, device):
     weights = {name.removeprefix('module.'): value for name, value in checkpoint['model_state_dict'].items()}
     model.load_state_dict(weights)
     return model.to(device)

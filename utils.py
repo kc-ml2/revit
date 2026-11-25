@@ -138,7 +138,7 @@ def _flop_forward(model, images):
     """One inference forward. Nested models are measured at their widest profile."""
     profiles = getattr(model, "profiles", None)
     if profiles and "profile" in inspect.signature(model.forward).parameters:
-        return model(images, profile=len(profiles) - 1), len(profiles) > 1
+        return model(images, profile=getattr(model, 'reference_profile', len(profiles) - 1)), len(profiles) > 1
     return model(images), False
 
 

@@ -9,7 +9,7 @@ from escnn.nn import FieldType, R2Conv
 from torch import nn
 from torch.nn import functional as F
 
-from group_space import get_gspace
+from group_space import SQUARE_GROUPS, get_gspace
 from revit_gcsa import _sdpa_spatial
 
 
@@ -80,21 +80,25 @@ class ProfileConv(nn.Module):
         self.out_rep_size = out_rep_size
         self.kernel = kernel
         self.register_buffer('basis', basis, persistent=False)
-        self.weights = nn.Parameter(torch.empty(out_fields[-1], in_fields[-1], basis.shape[0]))
+        max_in, max_out = max(in_fields), max(out_fields)
+        self.weights = nn.Parameter(torch.empty(max_out, max_in, basis.shape[0]))
         # Scale by the energy of the sampled basis and the widest fan-in.
-        std = math.sqrt(2 * out_rep_size / (in_fields[-1] * basis.square().sum().item()))
+        std = math.sqrt(2 * out_rep_size / (max_in * basis.square().sum().item()))
         nn.init.normal_(self.weights, std=std)
         self._filters = {}
         self.use_fourier = False
 
     def expand(self, profile):
+        return self._expand_basis(profile, self.basis, self.in_rep_size, self.out_rep_size)
+
+    def _expand_basis(self, profile, basis, in_order, out_order):
         num_in, num_out = self.in_fields[profile], self.out_fields[profile]
         coefficients = self.weights[:num_out, :num_in]
-        blocks = (coefficients @ self.basis).reshape(
-            num_out, num_in, self.out_rep_size, self.in_rep_size, self.kernel, self.kernel,
+        blocks = (coefficients @ basis).reshape(
+            num_out, num_in, out_order, in_order, self.kernel, self.kernel,
         )
         return blocks.transpose(1, 2).reshape(
-            num_out * self.out_rep_size, num_in * self.in_rep_size, self.kernel, self.kernel,
+            num_out * out_order, num_in * in_order, self.kernel, self.kernel,
         )
 
     def _fourier_filter(self, profile):
@@ -154,20 +158,22 @@ class ProfileNorm(nn.Module):
         super().__init__()
         # Regular fields are permutations. BatchNorm3d shares its affine and
         # statistics across the entire orientation axis of each field.
-        self.repr_size = repr_size
+        self.repr_sizes = (repr_size,) * len(widths) if isinstance(repr_size, int) else tuple(repr_size)
         self.norms = nn.ModuleList(nn.BatchNorm3d(width) for width in widths)
 
     def forward(self, x, profile):
         batch, channels, height, width = x.shape
         norm = self.norms[profile]
-        fields = x.reshape(batch, channels // self.repr_size, self.repr_size, height, width)
-        if norm.training and batch * self.repr_size * height * width == 1:
+        order = self.repr_sizes[profile]
+        fields = x.reshape(batch, channels // order, order, height, width)
+        if norm.training and batch * order * height * width == 1:
             # A singleton at a 1x1 final stage is possible for the trivial group.
             return F.batch_norm(fields, norm.running_mean, norm.running_var,
                                 norm.weight, norm.bias, training=False, eps=norm.eps).reshape_as(x)
         return norm(fields).reshape_as(x)
 
     def restrict(self, profile):
+        self.repr_sizes = (self.repr_sizes[profile],)
         self.norms = nn.ModuleList([self.norms[profile]])
 
 
@@ -224,7 +230,42 @@ class BudgetREViTConfig:
     window_sdpa: bool = False
 
 
-class BudgetAdaptiveREViT(nn.Module):
+class REViTBackbone(nn.Module):
+    """Shared stage layout and square-grid geometry for the profile models."""
+
+    def _build_stages(self, config, profiles, inputs, conv, norm):
+        self.entries = nn.ModuleList()
+        self.entry_norms = nn.ModuleList()
+        self.stages = nn.ModuleList()
+        for stage, (widths, depth, heads) in enumerate(zip(zip(*profiles), config.depths, config.heads)):
+            self.entries.append(conv(inputs, widths, 1 if stage == 0 else 3))
+            self.entry_norms.append(norm(widths))
+            self.stages.append(nn.ModuleList(
+                ProfileBlock(widths, heads, conv, norm, config.qkv_kernel, config.mlp_ratio,
+                             config.window_size, config.window_sdpa) for _ in range(depth)
+            ))
+            inputs = widths
+        self.classifier = nn.Linear(max(profile[-1] for profile in profiles), config.num_classes)
+
+    def _stem(self, x, profile=0):
+        x = centered_downsample(x, self.config.stem_downsample)
+        return self.stem_norm(self.stem(x, profile), profile).relu()
+
+    def _features(self, x, profile):
+        for stage, blocks in enumerate(self.stages):
+            if stage:
+                x = centered_downsample(x, 2)
+            x = self.entry_norms[stage](self.entries[stage](x, profile), profile).relu()
+            for block in blocks:
+                x = block(x, profile)
+        return x
+
+    def _classify(self, x, order):
+        x = x.reshape(x.shape[0], -1, order, *x.shape[-2:]).amax(dim=2).mean(dim=(-2, -1))
+        return F.linear(x, self.classifier.weight[:, :x.shape[1]], self.classifier.bias)
+
+
+class BudgetAdaptiveREViT(REViTBackbone):
     """One invariant route per image with a shared stem and nested REViT stages."""
 
     def __init__(self, config: BudgetREViTConfig):
@@ -237,7 +278,6 @@ class BudgetAdaptiveREViT(nn.Module):
         self.order = regular.size
         self.input_type = FieldType(self.gspace, [self.gspace.trivial_repr] * config.in_channels)
         self.stem_width = config.stem_width or self.profiles[0][0]
-        by_stage = list(zip(*self.profiles))
         bases = {}
 
         def conv(inputs, outputs, kernel, in_repr=regular):
@@ -251,20 +291,7 @@ class BudgetAdaptiveREViT(nn.Module):
 
         self.stem = conv((config.in_channels,), (self.stem_width,), 5, self.gspace.trivial_repr)
         self.stem_norm = norm((self.stem_width,))
-        self.entries = nn.ModuleList()
-        self.entry_norms = nn.ModuleList()
-        self.stages = nn.ModuleList()
-        inputs = (self.stem_width,) * len(self.profiles)
-        for stage, (widths, depth, heads) in enumerate(zip(by_stage, config.depths, config.heads)):
-            self.entries.append(conv(inputs, widths, 1 if stage == 0 else 3))
-            self.entry_norms.append(norm(widths))
-            self.stages.append(nn.ModuleList(
-                ProfileBlock(widths, heads, conv, norm, config.qkv_kernel, config.mlp_ratio,
-                             config.window_size, config.window_sdpa) for _ in range(depth)
-            ))
-            inputs = widths
-
-        self.classifier = nn.Linear(self.profiles[-1][-1], config.num_classes)
+        self._build_stages(config, self.profiles, (self.stem_width,) * len(self.profiles), conv, norm)
         self.router = None
         if len(self.profiles) > 1:
             self.router = nn.Sequential(nn.Linear(2 * self.stem_width + 1, config.router_hidden),
@@ -275,8 +302,8 @@ class BudgetAdaptiveREViT(nn.Module):
 
     @staticmethod
     def _validate(config):
-        if config.group not in ('C4', 'D4', 'Z2'):
-            raise ValueError('Use C4 or D4, or Z2 for the trivial-group baseline')
+        if config.group not in SQUARE_GROUPS:
+            raise ValueError(f'Use a supported square-grid group: {", ".join(SQUARE_GROUPS)}')
         if not config.profiles or not config.heads or len(config.heads) != len(config.depths):
             raise ValueError('Supply at least one profile and matching nonempty heads and depths')
         if config.window_size is None and len(config.depths) != 1:
@@ -330,25 +357,11 @@ class BudgetAdaptiveREViT(nn.Module):
             in_channels = channels
         return macs + profile[-1] * cfg.num_classes
 
-    def _stem(self, x):
-        x = centered_downsample(x, self.config.stem_downsample)
-        return self.stem_norm(self.stem(x, 0), 0).relu()
-
-    def _features(self, x, profile):
-        for stage, blocks in enumerate(self.stages):
-            if stage:
-                x = centered_downsample(x, 2)
-            x = self.entry_norms[stage](self.entries[stage](x, profile), profile).relu()
-            for block in blocks:
-                x = block(x, profile)
-        return x
-
     def _fields(self, x):
         return x.reshape(x.shape[0], -1, self.order, *x.shape[-2:])
 
     def _predict(self, x, profile):
-        x = self._fields(self._features(x, profile)).amax(dim=2).mean(dim=(-2, -1))
-        return F.linear(x, self.classifier.weight[:, :x.shape[1]], self.classifier.bias)
+        return self._classify(self._features(x, profile), self.order)
 
     @staticmethod
     def _validate_budget(early, budget):

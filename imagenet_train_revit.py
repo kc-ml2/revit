@@ -16,8 +16,12 @@ from torchvision import datasets, transforms
 from torchvision.transforms import v2 as T_v2
 from tqdm import tqdm
 from budget_cli import add_budget_arguments, budget_config, model_config, smooth_targets
-from budget_revit import BudgetAdaptiveREViT
+from budget_revit import BudgetAdaptiveREViT, BudgetREViTConfig
 from group_space import get_gspace
+from symmetry_supernet import (
+    SymmetrySupernet, SymmetrySupernetConfig, default_symmetry_profiles, parse_symmetry_profiles,
+    training_profile,
+)
 
 from revit_windowed_gcsa import Rot2DTransformerV2, count_parameters
 from utils import count_flops
@@ -105,7 +109,7 @@ def _to_cpu(obj):
     return obj
 
 
-def save_training_checkpoint(path, model, optimizer, scheduler, epoch, top1, device):
+def save_training_checkpoint(path, model, optimizer, scheduler, epoch, top1, device, profile_metrics=None):
     """Write checkpoint from CPU tensors so rank 0 does not spike GPU memory."""
     if device.type == "cuda":
         torch.cuda.synchronize()
@@ -117,6 +121,8 @@ def save_training_checkpoint(path, model, optimizer, scheduler, epoch, top1, dev
         "optimizer_state_dict": _to_cpu(optimizer.state_dict()),
         "scheduler_state_dict": _to_cpu(scheduler.state_dict()),
     }
+    if profile_metrics is not None:
+        payload['profile_metrics'] = profile_metrics
     torch.save(payload, path)
     del payload
     if device.type == "cuda":
@@ -127,14 +133,16 @@ def load_pretrained_weights(model: nn.Module, path: str, device: torch.device) -
     ckpt = torch.load(path, map_location=device, weights_only=False)
     if "model_state_dict" not in ckpt:
         raise KeyError(f"Checkpoint at {path} has no 'model_state_dict' key")
+    if isinstance(model, SymmetrySupernet) and ckpt.get('symmetry_supernet_config') != model_config(model)['symmetry_supernet_config']:
+        raise ValueError('A supernet resume requires the same backbone and ordered profiles as the checkpoint')
     model.load_state_dict(_strip_module_prefix(ckpt["model_state_dict"]))
     return ckpt
 
 
-def imagenet_validation_transform():
+def imagenet_validation_transform(image_size=224):
     return transforms.Compose([
-        transforms.Resize(256),
-        transforms.CenterCrop(224),
+        transforms.Resize(round(image_size * 256 / 224)),
+        transforms.CenterCrop(image_size),
         transforms.ToTensor(),
         transforms.Normalize(mean=(0.485, 0.456, 0.406), std=(0.229, 0.224, 0.225)),
     ])
@@ -150,13 +158,14 @@ def get_imagenet_loaders(
     randaugment_num_ops=2,
     randaugment_magnitude=9,
     random_erase=0.25,
+    image_size=224,
 ):
     train_dir = os.path.join(data_root, "train")
     val_dir = os.path.join(data_root, "val")
 
     normalize = transforms.Normalize(mean=(0.485, 0.456, 0.406), std=(0.229, 0.224, 0.225))
     train_list = [
-        transforms.RandomResizedCrop(224, scale=(0.08, 1.0)),
+        transforms.RandomResizedCrop(image_size, scale=(0.08, 1.0)),
         # RandomHorizontalFlip omitted: redundant under D4 / reflection groups.
     ]
     if randaugment:
@@ -171,7 +180,7 @@ def get_imagenet_loaders(
     train_tfms = transforms.Compose(train_list)
 
     train_ds = datasets.ImageFolder(train_dir, transform=train_tfms)
-    val_ds = datasets.ImageFolder(val_dir, transform=imagenet_validation_transform())
+    val_ds = datasets.ImageFolder(val_dir, transform=imagenet_validation_transform(image_size))
 
     train_sampler = DistributedSampler(train_ds, shuffle=True) if use_ddp else None
     val_sampler = DistributedSampler(val_ds, shuffle=False) if use_ddp else None
@@ -211,6 +220,7 @@ def train_one_epoch(
     mixup_prob=1.0,
     adaptive=False,
     num_classes=1000,
+    profile_schedule=None,
 ):
     model.train()
     hard_criterion = nn.CrossEntropyLoss(label_smoothing=label_smoothing)
@@ -234,7 +244,11 @@ def train_one_epoch(
                 _, image_losses = model(x, targets=targets)
                 loss = image_losses.mean()
             else:
-                out = model(x)
+                if profile_schedule is None:
+                    out = model(x)
+                else:
+                    profile = training_profile(*profile_schedule, epoch * len(loader) + steps)
+                    out = model(x, profile=profile)
                 loss = soft_criterion(out, y) if soft else hard_criterion(out, y)
 
         scaler.scale(loss).backward()
@@ -257,7 +271,7 @@ def train_one_epoch(
 
 
 @torch.no_grad()
-def evaluate(model, loader, device, rank, budget=None):
+def evaluate(model, loader, device, rank, budget=None, profile=None):
     model.eval()
     criterion = nn.CrossEntropyLoss()
     total_loss = 0.0
@@ -270,7 +284,10 @@ def evaluate(model, loader, device, rank, budget=None):
         y = y.to(device, non_blocking=True)
 
         with torch.autocast(device_type="cuda" if device.type == "cuda" else "cpu", dtype=torch.float16, enabled=device.type == "cuda"):
-            out = model(x) if budget is None else model(x, budget=budget)
+            if profile is not None:
+                out = model(x, profile=profile)
+            else:
+                out = model(x) if budget is None else model(x, budget=budget)
             loss = criterion(out, y)
 
         bs = y.size(0)
@@ -321,8 +338,9 @@ def main():
         help="Probability of choosing Mixup vs CutMix when both are enabled",
     )
     parser.add_argument("--num-classes", type=int, default=1000)
+    parser.add_argument("--image-size", type=int, default=224, help="ImageNet crop size")
 
-    parser.add_argument("--group-str", type=str, default='C4')
+    parser.add_argument("--group-str", type=str, help="Model group (default C4, or D4 for the symmetry supernet)")
     parser.add_argument(
         "--model-size",
         type=str,
@@ -342,6 +360,12 @@ def main():
     parser.add_argument("--fast-init", action="store_true", help="Use faster non-basis-aware init for R2Conv")
 
     parser.add_argument("--stem-downsample", type=int, default=4)
+    parser.add_argument('--symmetry-supernet', action='store_true',
+                        help='Train one D4 supernet with three widths each for D4 and C4')
+    parser.add_argument('--symmetry-profiles', type=parse_symmetry_profiles,
+                        help='Set stage widths with an optional leading stem, e.g. D4:8,12,24,48,96;C4:2,4,8,16,32')
+    parser.add_argument('--supernet-val-every', type=int, default=1,
+                        help='Run per-profile validation every N epochs and at the end')
     add_budget_arguments(parser)
     parser.add_argument("--ddp", action="store_true", help="Use DDP (launch via torchrun)")
     parser.add_argument("--data-parallel", action="store_true", help="Use DataParallel when not using DDP")
@@ -367,7 +391,13 @@ def main():
     if args.pretrained and not args.pretrained_path:
         parser.error("--pretrained-path is required when --pretrained is set")
     adaptive = args.budget_profiles is not None
-    if adaptive and any((args.dropout, args.attn_dropout, args.drop_path_rate, args.use_checkpoint)):
+    supernet = args.symmetry_supernet or args.symmetry_profiles is not None
+    args.group_str = args.group_str or ('D4' if supernet else 'C4')
+    if supernet and (adaptive or args.group_str != 'D4'):
+        parser.error('The symmetry supernet uses a D4 backbone and its own profile list')
+    if args.image_size < 1 or args.supernet_val_every < 1:
+        parser.error('--image-size and --supernet-val-every must be positive')
+    if (adaptive or supernet) and any((args.dropout, args.attn_dropout, args.drop_path_rate, args.use_checkpoint)):
         parser.error("The budget backbone uses deterministic blocks and does not implement legacy dropout or --use-checkpoint")
     if not 0 <= args.budget <= 1:
         parser.error("--budget must lie in [0, 1]")
@@ -408,6 +438,7 @@ def main():
         randaugment_num_ops=args.randaugment_num_ops,
         randaugment_magnitude=args.randaugment_magnitude,
         random_erase=args.random_erase,
+        image_size=args.image_size,
     )
 
     mixup_fn = build_mixup_cutmix(
@@ -426,9 +457,27 @@ def main():
             f"mixup_prob={args.mixup_prob}, switch_prob={args.mixup_switch_prob}"
         )
 
-    if adaptive:
+    profile_schedule = None
+    if supernet:
+        full = tuple(args.dims)
+        backbone = BudgetREViTConfig(
+            profiles=(full,), group='D4', num_classes=args.num_classes, image_size=args.image_size,
+            depths=tuple(args.depths), heads=tuple(args.heads), window_size=args.window_size,
+            mlp_ratio=args.mlp_ratio, qkv_kernel=args.qkv_kernel_size, stem_downsample=args.stem_downsample,
+            stem_width=args.budget_stem_width, window_sdpa=args.window_sdpa,
+        )
+        profiles = args.symmetry_profiles or default_symmetry_profiles(full, backbone.heads)
+        model = SymmetrySupernet(SymmetrySupernetConfig(backbone, profiles))
+        profiles = tuple(zip((group for group, _ in model.profiles), model.stage_widths, model.stem_widths))
+        profile_schedule = (model.reference_profile, len(profiles))
+        if is_main_process(rank):
+            print(f'Symmetry supernet profiles: {profiles}')
+            steps = len(train_loader) * args.epochs
+            if steps < 2 * (len(profiles) - 1):
+                print('This run has too few training steps to visit every profile.')
+    elif adaptive:
         model = BudgetAdaptiveREViT(budget_config(
-            args, in_channels=3, num_classes=args.num_classes, image_size=224,
+            args, in_channels=3, num_classes=args.num_classes, image_size=args.image_size,
             depths=tuple(args.depths), heads=tuple(args.heads), window_size=args.window_size,
             mlp_ratio=args.mlp_ratio, qkv_kernel=args.qkv_kernel_size, stem_downsample=args.stem_downsample,
         ))
@@ -461,13 +510,14 @@ def main():
             print(f"Loaded pretrained weights from {args.pretrained_path}")
 
     if use_ddp:
-        model = DDP(model, device_ids=[local_rank], output_device=local_rank)
+        model = DDP(model, device_ids=[local_rank], output_device=local_rank,
+                    find_unused_parameters=supernet and len(profiles) > 1)
     elif args.data_parallel and torch.cuda.device_count() > 1:
         model = nn.DataParallel(model)
 
     if is_main_process(rank):
         count_parameters(model)
-        count_flops(model, (3, 224, 224))
+        count_flops(model, (3, args.image_size, args.image_size))
         os.makedirs(args.output_dir, exist_ok=True)
         os.makedirs(os.path.join(args.output_dir, "checkpoints"), exist_ok=True)
         # os.makedirs(os.path.join(args.output_dir, "runs"), exist_ok=True)
@@ -527,17 +577,38 @@ def main():
             mixup_prob=args.mixup_prob,
             adaptive=adaptive,
             num_classes=args.num_classes,
+            profile_schedule=profile_schedule,
         )
         scheduler.step()
 
-        val_loss, top1, top5 = evaluate(model, val_loader, device, rank if use_ddp else None,
-                                        budget=args.budget if adaptive else None)
+        eval_rank = rank if use_ddp else None
+        profile_metrics = None
+        if supernet:
+            completed = epoch - start_epoch + 1
+            if completed % args.supernet_val_every and completed != args.epochs:
+                if is_main_process(rank):
+                    writer.add_scalar('train/loss', train_loss, epoch)
+                    print(f'Epoch {epoch:03d} | train_loss={train_loss:.4f}')
+                continue
+            scores = [evaluate(model, val_loader, device, eval_rank, profile=i) for i in range(len(profiles))]
+            val_loss, top1, top5 = (sum(metric) / len(scores) for metric in zip(*scores))
+            profile_metrics = [dict(group=group, widths=widths, stem_width=stem, loss=loss, top1=acc, top5=acc5)
+                               for (group, widths, stem), (loss, acc, acc5) in zip(profiles, scores)]
+        else:
+            val_loss, top1, top5 = evaluate(model, val_loader, device, eval_rank,
+                                            budget=args.budget if adaptive else None)
 
         if is_main_process(rank):
             writer.add_scalar("train/loss", train_loss, epoch)
             writer.add_scalar("val/loss", val_loss, epoch)
             writer.add_scalar("val/top1", top1, epoch)
             writer.add_scalar("val/top5", top5, epoch)
+            if profile_metrics is not None:
+                for idx, metrics in enumerate(profile_metrics):
+                    tag = f'profile_{idx}_{metrics["group"]}'
+                    writer.add_scalar(f'val/{tag}/top1', metrics['top1'], epoch)
+                    print(f'  {tag} stem={metrics["stem_width"]} {metrics["widths"]} '
+                          f'| top1={metrics["top1"]:.4f} | top5={metrics["top5"]:.4f}')
             print(
                 f"Epoch {epoch:03d} | train_loss={train_loss:.4f} | val_loss={val_loss:.4f} | top1={top1:.4f} | top5={top5:.4f}"
             )
@@ -545,9 +616,8 @@ def main():
             if top1 > best_top1:
                 best_top1 = top1
                 best_epoch = epoch
-                best_ckpt_path = os.path.join(
-                    args.output_dir, "checkpoints", f"imagenet_es_v2_best_epoch_{best_epoch}.pt"
-                )
+                checkpoint_prefix = 'imagenet_symmetry_supernet' if supernet else 'imagenet_es_v2'
+                best_ckpt_path = os.path.join(args.output_dir, 'checkpoints', f'{checkpoint_prefix}_best_epoch_{best_epoch}.pt')
                 save_training_checkpoint(
                     best_ckpt_path,
                     model,
@@ -556,14 +626,16 @@ def main():
                     best_epoch,
                     best_top1,
                     device,
+                    profile_metrics=profile_metrics,
                 )
 
     if is_main_process(rank):
         writer.close()
         if best_ckpt_path is not None:
             ckpt = torch.load(best_ckpt_path, map_location="cpu", weights_only=False)
+            metadata = model_config(model)
             torch.save(
-                {key: ckpt[key] for key in ('budget_config', 'model_state_dict')} if adaptive else ckpt["model_state_dict"],
+                {**metadata, 'model_state_dict': ckpt['model_state_dict']} if metadata else ckpt['model_state_dict'],
                 os.path.join(
                     args.output_dir,
                     f"imagenet_revit_{args.group_str}_{args.model_size}_best_top1_{best_top1:.4f}_epoch_{best_epoch}.pth",

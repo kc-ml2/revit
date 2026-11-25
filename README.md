@@ -3,6 +3,7 @@
 
 REViT is a research codebase for rotation/roto-reflection equivariant vision transformers. It contains:
 
+- a symmetry-and-width supernet that trains one shared D4 model and exports standalone subgroup profiles,
 - a budget-adaptive REViT with nested widths and one invariant decision per image,
 - an equivariant transformer baseline (`Rot2DTransformer`) for small image datasets,
 - a windowed hierarchical equivariant transformer (`Rot2DTransformerV2`) for ImageNet-scale training.
@@ -11,8 +12,9 @@ REViT is a research codebase for rotation/roto-reflection equivariant vision tra
 
 ### Core models
 
+- `symmetry_supernet.py`: D4 coefficient sharing, subgroup crops, sampled profile training, and native checkpoint export.
 - `budget_revit.py`: shared lifting stem, nested steerable convolutions, global and windowed profiles, invariant controller, and fixed-profile export.
-- `budget_cli.py`: shared adaptive flags, config serialization, and checkpoint loading.
+- `budget_cli.py`: shared adaptive flags, config serialization, and checkpoint loading for both profile models.
 - `revit_gcsa.py`: original/global-attention equivariant transformer (`Rot2DTransformer`).
 - `revit_windowed_gcsa.py`: windowed hierarchical equivariant transformer (`Rot2DTransformerV2`).
 - `group_space.py`: maps group strings (`C4`, `D4`, etc.) to ESCNN `gspaces`.
@@ -20,7 +22,7 @@ REViT is a research codebase for rotation/roto-reflection equivariant vision tra
 ### Training scripts
 
 - `train_revit.py`: global or adaptive training entrypoint for `rotmnist`, `cifar10`, and `pcam` datasets.
-- `imagenet_train_revit.py`: ImageNet training for the original and adaptive windowed models (DDP, AMP, Mixup/CutMix, checkpoint resume).
+- `imagenet_train_revit.py`: ImageNet training for the symmetry supernet and the original and adaptive windowed models (DDP, AMP, Mixup/CutMix, checkpoint resume).
 - `imagenet_train_vit.py`: ImageNet training for a vanilla `torchvision` ViT-Small baseline.
 
 ### Dataset utilities
@@ -31,8 +33,9 @@ REViT is a research codebase for rotation/roto-reflection equivariant vision tra
 
 ### Experiments and utilities
 
+- `scripts/run_supernet.py`: list trained profiles, export standalone checkpoints, and build cold-cropped controls.
 - `scripts/run_budget.py`: evaluate budgets and controls, benchmark end-to-end forwards, and export fixed profiles.
-- `tests/test_budget_revit.py`: numerical symmetry, real operator shapes, training, and checkpoint tests.
+- `tests/test_budget_revit.py`, `tests/test_symmetry_supernet.py`: numerical symmetry, operator shapes, training, and checkpoint tests.
 - `utils.py`: standalone quarter-turn augmentation and early-stopping utilities.
 - `scripts/cleanup_checkpoints.py`: keep only the newest N checkpoint files in a directory.
 - `scripts/benchmark_sdpa.py`: compare bmm vs SDPA attention paths for latency/memory.
@@ -42,7 +45,7 @@ REViT is a research codebase for rotation/roto-reflection equivariant vision tra
 
 You can pass `--group-str` as one of:
 
-`Z2`, `D2`, `C4`, `C8`, `C12`, `C16`, `D4`, `D8`, `D12`, `D16`. The adaptive backbone supports C4 and D4, plus the trivial-group `Z2` control.
+The profile models support `D4` (8 actions), `C4` (4 rotations), `D2_4` (half-turn and two mirrors), `C2` (half-turn), `Cs` (one mirror), and `C1` (identity). Legacy `D2` is an alias for `Cs`, and legacy `Z2` is an alias for `C1`. The original REViT backbones also accept `C8`, `C12`, `C16`, `D8`, `D12`, and `D16`.
 
 ## Setup
 
@@ -58,6 +61,89 @@ pip install torch torchvision
 # Remaining dependencies
 pip install -r requirements.txt
 ```
+
+## Train once and export symmetry and width profiles
+
+The symmetry supernet shares one bank of $D_4$ steerable coefficients. Each training step selects a `(group, stage widths)` profile. A smaller profile slices whole fields and retains one complete orbit of its subgroup inside each field, starting at the lift. Each profile keeps separate normalization state. At export, the tool converts the selected weights into the native steerable basis of its group. The resulting checkpoint runs as a standalone REViT and can be fine-tuned within its exported group.
+
+### Tiny proof of concept on ImageNet-1K
+
+`--model-size tiny` selects the REViT Tiny preset with widths `12,24,48,96`, depths `1,2,3,1`, and heads `1,2,4,8`. Training uses standard 224-pixel ImageNet crops and 1,000 classes by default. Pass the ImageNet-1K root containing `train/<class>/` and `val/<class>/`.
+
+```bash
+python imagenet_train_revit.py --symmetry-supernet --model-size tiny \
+  --data-root /path/to/imagenet --output-dir runs_supernet/tiny \
+  --epochs 1 --warmup-epochs 0 --batch-size 8
+```
+
+The defaults train `D4` and `C4` at three head-aligned widths each. The full-width $D_4$ profile runs every other optimizer step, and the remaining steps cycle through the other profiles. Each validation sweep reports every profile. The mean profile top-1 selects the checkpoint. Our local PoC ran this preset at 224 pixels with a synthetic ImageFolder fixture, exercising training and export at the ImageNet input and output shapes.
+
+For custom profiles, use `--symmetry-profiles 'D4:8,12,24,48,96;C4:2,4,8,16,32'`. With five numbers, the first is the stem width in regular fields, followed by the four stage widths. A four-number profile uses `--budget-stem-width`, or the smallest first-stage width across profiles when the flag is omitted. Each stem width must fit its own first stage. Stage widths must fit within the parent and divide evenly across attention heads. Include a `D4` profile with the full stage widths from the preset or `--dims`. If you specify several full-stage `D4` profiles, the one with the largest stem is the training reference.
+
+### Export, evaluate, and fine-tune
+
+```bash
+CKPT=runs_supernet/tiny/checkpoints/imagenet_symmetry_supernet_best_epoch_0.pt
+python -m scripts.run_supernet list "$CKPT"
+python -m scripts.run_supernet export "$CKPT" 3 runs_supernet/c4_small.pt --verify
+python -m scripts.run_budget evaluate runs_supernet/c4_small.pt \
+  --dataset imagenet --data-root /path/to/imagenet --check-group
+```
+
+For the default profile ordering, index `3` is `C4:4,8,16,32`. Benchmark the export with `scripts.run_budget benchmark --checkpoint ...`. To fine-tune, match the export's group, head counts, depths, stem width and resolution. The default Tiny example uses:
+
+```bash
+python imagenet_train_revit.py --model-size tiny --group-str C4 \
+  --budget-profiles '4,8,16,32' --budget-stem-width 4 \
+  --data-root /path/to/imagenet --output-dir runs_supernet/c4_finetune \
+  --pretrained --pretrained-weights-only --pretrained-path runs_supernet/c4_small.pt
+```
+
+For the cold-crop control, train a width-only `D4` singleton with the same backbone and stem width. Crop that checkpoint to the target group and width before evaluation and optional fine-tuning.
+
+```bash
+python -m scripts.run_supernet crop-d4 d4_only.pt C4 c4_cold.pt --widths 4 8 16 32
+```
+
+Prepend a stem width to `--widths` to crop the lift as well. The export metadata and `scripts.run_supernet list` report stem width separately from the stage widths.
+
+### Distributed supernet training on ImageNet-1K
+
+Run from the repository root with CUDA-enabled PyTorch. Launch one process per GPU with `torchrun` and pass `--ddp` to the trainer. Each process loads `--batch-size` images per step, so the global batch size is the per-GPU batch size multiplied by the total number of GPUs. `--num-workers` is also per process. Checkpoints and TensorBoard logs are written by rank zero.
+
+**Single node, two GPUs.** Use the actual Tiny preset for a one-epoch DDP smoke test with custom stem widths. This example uses a global batch of 16.
+
+```bash
+torchrun --standalone --nproc-per-node=2 imagenet_train_revit.py --ddp \
+  --model-size tiny \
+  --symmetry-profiles 'D4:8,12,24,48,96;C4:2,4,8,16,32' \
+  --data-root /path/to/imagenet --output-dir runs_supernet/tiny_ddp \
+  --epochs 1 --warmup-epochs 0 --batch-size 8 --num-workers 4
+```
+
+**Single node, four GPUs.** Use Large with the default six symmetry and width profiles. The global batch size here is 32. `--supernet-val-every 5` evaluates all profiles every fifth epoch and again at the end of training.
+
+```bash
+torchrun --standalone --nproc-per-node=4 imagenet_train_revit.py --ddp \
+  --symmetry-supernet --model-size large --data-root /path/to/imagenet \
+  --output-dir runs_supernet/large --batch-size 8 --num-workers 4 \
+  --epochs 300 --warmup-epochs 20 --supernet-val-every 5
+```
+
+Choose the per-GPU batch size based on the full-width $D_4$ training step, which expands the largest dense kernels.
+
+**Two nodes, four GPUs per node.** Run the command on both nodes. Set `NODE_RANK` to `0` on the first node and `1` on the second. Set `MASTER_ADDR` on both nodes to the hostname or IP address of node 0. Both nodes need access to the same ImageNet train and validation splits. The global batch size in this example is 64.
+
+```bash
+torchrun --nnodes=2 --nproc-per-node=4 --node-rank="$NODE_RANK" \
+  --master-addr="$MASTER_ADDR" --master-port=29500 \
+  imagenet_train_revit.py --ddp --symmetry-supernet --model-size large \
+  --data-root /path/to/imagenet --output-dir /shared/runs_supernet/large \
+  --batch-size 8 --num-workers 4 --epochs 300 --warmup-epochs 20 \
+  --supernet-val-every 5
+```
+
+To resume, use the same backbone and ordered profile list, including stem widths. Add `--pretrained --pretrained-path /path/to/checkpoints/imagenet_symmetry_supernet_best_epoch_4.pt` to the launch command and set `--epochs` to the number of additional epochs. Use a training `.pt` checkpoint accessible to every rank so the trainer can restore the optimizer and learning-rate scheduler.
 
 ## Budget-adaptive REViT
 
@@ -116,7 +202,7 @@ Use `export --widths` to prune a source profile to whole-field prefixes and init
 
 ```bash
 python -m pip install pytest
-python -m pytest -q tests/test_budget_revit.py
+python -m pytest -q tests/test_budget_revit.py tests/test_symmetry_supernet.py
 ```
 
 ## Legacy REViT usage
