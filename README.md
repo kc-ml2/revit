@@ -1,5 +1,10 @@
 # REViT — Roto-reflection Equivariant convolutional Vision Transformer
-**PAPER:** [![arXiv](https://img.shields.io/badge/arXiv-2606.25318-b31b1b.svg)](https://arxiv.org/abs/2606.25318)
+
+<p align="center">
+  <img src="revit_poster.png" alt="REViT poster" width="800">
+</p>
+
+**PAPER:** [Proceedings of Machine Learning Research](https://proceedings.mlr.press/v306/zaheer26a.html) | [![arXiv](https://img.shields.io/badge/arXiv-2606.25318-b31b1b.svg)](https://arxiv.org/abs/2606.25318)
 
 REViT is a research codebase for rotation/roto-reflection equivariant vision transformers. It contains:
 
