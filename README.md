@@ -1,7 +1,7 @@
 # REViT — Roto-reflection Equivariant convolutional Vision Transformer
 
 <p align="center">
-  <img src="revit_poster.png" alt="REViT poster" width="800">
+  <img src="revit_poster_eng.png" alt="REViT poster" width="800">
 </p>
 
 **PAPER:** [[PMLR]](https://proceedings.mlr.press/v306/zaheer26a.html) [[arXiv]](https://arxiv.org/abs/2606.25318)
