@@ -20,6 +20,7 @@ from budget_revit import BudgetAdaptiveREViT
 from group_space import get_gspace
 
 from revit_windowed_gcsa import Rot2DTransformerV2, count_parameters
+from utils import count_flops
 
 
 class SoftTargetCrossEntropy(nn.Module):
@@ -466,6 +467,7 @@ def main():
 
     if is_main_process(rank):
         count_parameters(model)
+        count_flops(model, (3, 224, 224))
         os.makedirs(args.output_dir, exist_ok=True)
         os.makedirs(os.path.join(args.output_dir, "checkpoints"), exist_ok=True)
         # os.makedirs(os.path.join(args.output_dir, "runs"), exist_ok=True)

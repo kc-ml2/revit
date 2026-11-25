@@ -17,6 +17,7 @@ from budget_revit import BudgetAdaptiveREViT
 from datasets import get_rot_mnist_loaders, get_cifar10_loaders, get_pcam_loaders
 from group_space import get_gspace
 from revit_gcsa import Rot2DTransformer, count_parameters
+from utils import count_flops
 
 
 device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -79,10 +80,9 @@ def test_step(model, x, y, device="cuda", budget=None):
     with autocast(device_type=device, dtype=torch.bfloat16, enabled=device == "cuda" or budget is None):
         out = model(x) if budget is None else model(x, budget=budget)
         loss = F.cross_entropy(out, y)
-   
+
     preds = out.argmax(dim=1)
     correct = (preds == y).sum().item()
-    # total += y.size(0)
     return loss.item(), correct, y.size(0)
 
 
@@ -118,7 +118,7 @@ def revit_train(
                                            pin_memory=device == 'cuda', data_root=data_root)
     if validation_fraction:
         train_loader, test_loader = held_out_loaders(train_loader, test_loader, validation_fraction, seed)
-    _, in_channels, num_classes, _ = DATASETS[dataset]
+    _, in_channels, num_classes, image_size = DATASETS[dataset]
     if adaptive_config is None:
         model = Rot2DTransformer(
             depth=depth, in_channels=in_channels, channels=channels, heads=heads,
@@ -133,6 +133,7 @@ def revit_train(
             model = torch.nn.DataParallel(model)
     model.to(device)
     count_parameters(model)
+    count_flops(model, (in_channels, image_size, image_size))
 
     if pretrained:
         if not checkpoint_path:
@@ -223,7 +224,7 @@ def main():
     parser.add_argument('--channels', type=int, default=12, help='Legacy regular fields')
     parser.add_argument('--heads', type=int, nargs='+', default=(6,))
     parser.add_argument('--depths', type=int, nargs='+', default=(4,))
-    parser.add_argument('--downsize', type=int, default=2)
+    parser.add_argument('--downsize', type=int, default=1)
     parser.add_argument('--conv-kernel-size', type=int, default=5)
     parser.add_argument('--conv-attn', action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument('--window-size', type=int, help='Use a windowed adaptive model')

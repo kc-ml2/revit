@@ -34,7 +34,6 @@ REViT is a research codebase for rotation/roto-reflection equivariant vision tra
 - `scripts/run_budget.py`: evaluate budgets and controls, benchmark end-to-end forwards, and export fixed profiles.
 - `tests/test_budget_revit.py`: numerical symmetry, real operator shapes, training, and checkpoint tests.
 - `utils.py`: standalone quarter-turn augmentation and early-stopping utilities.
-- `analysis/`: [technical report](analysis/BUDGET_REViT_TECHNICAL_REPORT.md), [research paper](output/pdf/budget_revit_paper.pdf), [LaTeX source](analysis/budget_revit_paper.tex), and REViT background notes.
 - `scripts/cleanup_checkpoints.py`: keep only the newest N checkpoint files in a directory.
 - `scripts/benchmark_sdpa.py`: compare bmm vs SDPA attention paths for latency/memory.
 - `requirements.txt` / `requirements-lock.txt`: install deps and optional pinned lockfile.

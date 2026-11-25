@@ -17,6 +17,8 @@ from torchvision import datasets, transforms
 from torchvision.models.vision_transformer import VisionTransformer
 from tqdm import tqdm
 
+from utils import count_flops
+
 
 def count_parameters(model: nn.Module):
     total_params = sum(p.numel() for p in model.parameters())
@@ -254,6 +256,7 @@ def main():
 
     if is_main_process(rank):
         count_parameters(model)
+        count_flops(model, (3, args.image_size, args.image_size))
         os.makedirs(args.output_dir, exist_ok=True)
         os.makedirs(os.path.join(args.output_dir, "checkpoints"), exist_ok=True)
         run_id = datetime.now().strftime("%Y%m%d_%H%M%S")
