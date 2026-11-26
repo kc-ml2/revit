@@ -193,6 +193,9 @@ def revit_train(
         if accuracy > best_accuracy:
             best_accuracy, best_epoch = accuracy, epoch
             best_model = copy.deepcopy(model.state_dict())
+            checkpoint_dir = output / 'checkpoints'
+            best_path = checkpoint_dir / f'{run_name}_best.pt'
+            tmp_path = best_path.with_suffix('.pt.tmp')
             torch.save({
                 **metadata,
                 'epoch': best_epoch,
@@ -200,7 +203,12 @@ def revit_train(
                 'optimizer_state_dict': optimizer.state_dict(),
                 'scheduler_state_dict': scheduler.state_dict(),
                 'loss': validation_loss,
-            }, output / 'checkpoints' / f'{run_name}_{best_epoch}.pt')
+            }, tmp_path)
+            tmp_path.replace(best_path)
+            for path in checkpoint_dir.glob(f'{run_name}_*.pt'):
+                suffix = path.name[len(run_name) + 1:-3]
+                if suffix.isdigit():
+                    path.unlink()
 
         train_loss = total_loss / len(train_loader)
         writer.add_scalar('train_loss', train_loss, epoch)

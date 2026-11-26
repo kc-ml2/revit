@@ -123,10 +123,55 @@ def save_training_checkpoint(path, model, optimizer, scheduler, epoch, top1, dev
     }
     if profile_metrics is not None:
         payload['profile_metrics'] = profile_metrics
-    torch.save(payload, path)
+    tmp_path = f"{path}.tmp"
+    torch.save(payload, tmp_path)
+    os.replace(tmp_path, path)
     del payload
     if device.type == "cuda":
         torch.cuda.empty_cache()
+
+
+def prune_previous_best_checkpoints(directory, prefix):
+    """Keep the rolling best file and delete epoch-tagged best checkpoints from this run."""
+    marker = f"{prefix}_best_epoch_"
+    for name in os.listdir(directory):
+        if name.startswith(marker) and name.endswith(".pt"):
+            os.remove(os.path.join(directory, name))
+
+
+def _format_lr(lr):
+    mantissa, exponent = f"{lr:.0e}".split("e")
+    return f"{mantissa}e{int(exponent)}"
+
+
+def tensorboard_run_name(args, mode, profiles=None):
+    """Name the TensorBoard run so the log directory identifies the training setup."""
+    parts = [
+        "imagenet",
+        mode,
+        args.model_size,
+        args.group_str,
+        "d" + "-".join(map(str, args.dims)),
+        f"img{args.image_size}",
+        f"lr{_format_lr(args.lr)}",
+        f"bs{args.batch_size}",
+        f"ep{args.epochs}",
+        f"wu{args.warmup_epochs}",
+    ]
+    if profiles is not None:
+        tokens = [f"{group}s{stem}_" + "x".join(map(str, widths)) for group, widths, stem in profiles]
+        parts.append("profiles-" + "+".join(tokens))
+    elif args.budget_profiles:
+        stem = f"s{args.budget_stem_width}" if args.budget_stem_width else "sauto"
+        tokens = ["x".join(map(str, widths)) for widths in args.budget_profiles]
+        parts.append(f"profiles-{stem}-" + "+".join(tokens))
+        parts.append(f"budget{args.budget:g}")
+    if args.pretrained and not args.pretrained_weights_only:
+        parts.append("resume")
+    elif args.pretrained:
+        parts.append("finetune")
+    parts.append(datetime.now().strftime("%Y%m%d_%H%M%S"))
+    return "_".join(parts)
 
 
 def load_pretrained_weights(model: nn.Module, path: str, device: torch.device) -> dict:
@@ -520,8 +565,10 @@ def main():
         count_flops(model, (3, args.image_size, args.image_size))
         os.makedirs(args.output_dir, exist_ok=True)
         os.makedirs(os.path.join(args.output_dir, "checkpoints"), exist_ok=True)
-        # os.makedirs(os.path.join(args.output_dir, "runs"), exist_ok=True)
-        writer = SummaryWriter(log_dir=os.path.join(args.output_dir, "runs", f"imagenet_revit_{args.group_str}_{args.model_size}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"))
+        mode = "supernet" if supernet else "budget" if adaptive else "revit"
+        log_dir = os.path.join(args.output_dir, "runs", tensorboard_run_name(args, mode, profiles if supernet else None))
+        print(f"TensorBoard log dir: {log_dir}")
+        writer = SummaryWriter(log_dir=log_dir)
     else:
         writer = None
 
@@ -617,7 +664,8 @@ def main():
                 best_top1 = top1
                 best_epoch = epoch
                 checkpoint_prefix = 'imagenet_symmetry_supernet' if supernet else 'imagenet_es_v2'
-                best_ckpt_path = os.path.join(args.output_dir, 'checkpoints', f'{checkpoint_prefix}_best_epoch_{best_epoch}.pt')
+                checkpoint_dir = os.path.join(args.output_dir, 'checkpoints')
+                best_ckpt_path = os.path.join(checkpoint_dir, f'{checkpoint_prefix}_best.pt')
                 save_training_checkpoint(
                     best_ckpt_path,
                     model,
@@ -628,6 +676,7 @@ def main():
                     device,
                     profile_metrics=profile_metrics,
                 )
+                prune_previous_best_checkpoints(checkpoint_dir, checkpoint_prefix)
 
     if is_main_process(rank):
         writer.close()

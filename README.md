@@ -83,7 +83,7 @@ For custom profiles, use `--symmetry-profiles 'D4:8,12,24,48,96;C4:2,4,8,16,32'`
 ### Export, evaluate, and fine-tune
 
 ```bash
-CKPT=runs_supernet/tiny/checkpoints/imagenet_symmetry_supernet_best_epoch_0.pt
+CKPT=runs_supernet/tiny/checkpoints/imagenet_symmetry_supernet_best.pt
 python -m scripts.run_supernet list "$CKPT"
 python -m scripts.run_supernet export "$CKPT" 3 runs_supernet/c4_small.pt --verify
 python -m scripts.run_budget evaluate runs_supernet/c4_small.pt \
@@ -143,7 +143,7 @@ torchrun --nnodes=2 --nproc-per-node=4 --node-rank="$NODE_RANK" \
   --supernet-val-every 5
 ```
 
-To resume, use the same backbone and ordered profile list, including stem widths. Add `--pretrained --pretrained-path /path/to/checkpoints/imagenet_symmetry_supernet_best_epoch_4.pt` to the launch command and set `--epochs` to the number of additional epochs. Use a training `.pt` checkpoint accessible to every rank so the trainer can restore the optimizer and learning-rate scheduler.
+To resume, use the same backbone and ordered profile list, including stem widths. Add `--pretrained --pretrained-path /path/to/checkpoints/imagenet_symmetry_supernet_best.pt` to the launch command and set `--epochs` to the number of additional epochs. Training keeps one rolling best checkpoint for the run; the epoch and top-1 are stored inside that file. Use a training `.pt` checkpoint accessible to every rank so the trainer can restore the optimizer and learning-rate scheduler.
 
 ## Budget-adaptive REViT
 
@@ -326,6 +326,8 @@ tensorboard --logdir imagenet_es_v2_outputs/runs
 # ImageNet ViT baseline runs
 tensorboard --logdir imagenet_vit_small_outputs/runs
 ```
+
+Each ImageNet run writes its own directory. The name records the setup: model family (`supernet`, `budget`, `revit`, or `vit_small`), size, group, stage widths, image size, learning rate, per-GPU batch size, epochs, and warmup. Supernet and budget runs also list their profiles. A resumed or weights-only run adds `resume` or `finetune`. The timestamp keeps repeated launches separate.
 
 ## Model Zoo
 

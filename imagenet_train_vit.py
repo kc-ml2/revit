@@ -20,6 +20,20 @@ from tqdm import tqdm
 from utils import count_flops
 
 
+def _format_lr(lr):
+    mantissa, exponent = f"{lr:.0e}".split("e")
+    return f"{mantissa}e{int(exponent)}"
+
+
+def tensorboard_run_name(args):
+    """Name the TensorBoard run so the log directory identifies the training setup."""
+    stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    return (
+        f"imagenet_vit_small_p{args.patch_size}_img{args.image_size}_"
+        f"lr{_format_lr(args.lr)}_bs{args.batch_size}_ep{args.epochs}_wu{args.warmup_epochs}_{stamp}"
+    )
+
+
 def count_parameters(model: nn.Module):
     total_params = sum(p.numel() for p in model.parameters())
     trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
@@ -259,8 +273,9 @@ def main():
         count_flops(model, (3, args.image_size, args.image_size))
         os.makedirs(args.output_dir, exist_ok=True)
         os.makedirs(os.path.join(args.output_dir, "checkpoints"), exist_ok=True)
-        run_id = datetime.now().strftime("%Y%m%d_%H%M%S")
-        writer = SummaryWriter(log_dir=os.path.join(args.output_dir, "runs", f"imagenet_vit_small_{run_id}"))
+        log_dir = os.path.join(args.output_dir, "runs", tensorboard_run_name(args))
+        print(f"TensorBoard log dir: {log_dir}")
+        writer = SummaryWriter(log_dir=log_dir)
     else:
         writer = None
 
@@ -309,6 +324,9 @@ def main():
                 best_top1 = top1
                 best_epoch = epoch
                 best_state = copy.deepcopy(model.state_dict())
+                checkpoint_dir = os.path.join(args.output_dir, "checkpoints")
+                best_path = os.path.join(checkpoint_dir, "imagenet_vit_small_best.pt")
+                tmp_path = f"{best_path}.tmp"
                 torch.save(
                     {
                         "epoch": best_epoch,
@@ -317,8 +335,12 @@ def main():
                         "scheduler_state_dict": scheduler.state_dict(),
                         "top1": best_top1,
                     },
-                    os.path.join(args.output_dir, "checkpoints", f"imagenet_vit_small_best_epoch_{best_epoch}.pt"),
+                    tmp_path,
                 )
+                os.replace(tmp_path, best_path)
+                for name in os.listdir(checkpoint_dir):
+                    if name.startswith("imagenet_vit_small_best_epoch_") and name.endswith(".pt"):
+                        os.remove(os.path.join(checkpoint_dir, name))
 
     if is_main_process(rank):
         writer.close()
